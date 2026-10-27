@@ -180,10 +180,11 @@ pub(super) fn gm_episode_since(gm_conn: crate::ims::GmConnectionState) -> System
 /// still-live Gm SA and restart the reader thread that had died with the old
 /// socket. Mirrors what `hangup_carrier` does reactively — reused here
 /// proactively (specs/028 R6).
-fn reconnect_gm_client(
+pub(super) fn reconnect_gm_client(
     session: &mut crate::ims::RegisteredSession,
     inbound: &Inbound,
 ) -> BridgeResult<()> {
+    crate::ims::session::stop_client_reader(session, inbound);
     session.reconnect_transport()?;
     restart_client_reader(session, inbound)
 }
@@ -263,6 +264,15 @@ pub(super) fn probe_gm_connection(
             ping.pending = None;
             client_down = true;
         }
+    }
+
+    // The reader of the client connection ends when the network closes it. With
+    // no periodic keepalive that is the only early sign, and Jio closes an
+    // idle Gm connection within minutes.
+    if !client_down && !inbound.client_reader_alive() {
+        tracing::warn!("Gm client connection was closed by the network; rebuilding it");
+        ping.pending = None;
+        client_down = true;
     }
 
     if !client_down && !listener_restart_failed {

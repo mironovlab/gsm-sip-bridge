@@ -41,8 +41,39 @@ when `[vowifi].enabled = true` — see `gsm-sip-bridge/src/supervise/orchestrate
 
 - Keeps a persistent IMS-AKA registration alive via `super::register_session` (kept alive rather
   than immediately cleaned up, unlike the one-shot `ims-register`/`ims-call` CLI tools), renewing
-  it before `Expires` lapses (`renewal_due` in `ims/mod.rs`) with exponential backoff on failure
-  (`next_backoff`).
+  it before `Expires` lapses with exponential backoff on failure (`next_backoff`). The renewal
+  falls due on the schedule of [3GPP TS 24.229 §5.1.1.4.1](https://www.etsi.org/deliver/etsi_ts/124200_124299/124229/18.10.00_60/ts_124229v181000p.pdf)
+  (`registration_refresh_offset` in `ims/mod.rs`): 600 seconds before expiry when the registrar
+  granted more than 1200 seconds, halfway through the grant otherwise, and never sooner than 60
+  seconds after the registration. A one-hour grant therefore renews after 50 minutes. A grant
+  under 120 seconds logs a warning, because the binding can lapse before its refresh.
+- Refreshes the registration **in place**: a protected `REGISTER` on the live Gm connection with
+  the authorization of the last accepted registration (the last nonce and the last calculated
+  response, TS 24.229 §5.1.1.4.2), the registration's own Call-ID and a REGISTER-only `CSeq` that
+  rises by one each time (RFC 3261 §10.2). It is a transaction owned by the dispatch loop
+  (`ims/agent/registration_refresh.rs`): sent, retransmitted on the IMS timers (T1 2 s, T2 16 s) and
+  timed out (Timer F, 128 s) from the loop's passes, so calls, notifications and SMS are served
+  while it is outstanding. **An active call or a pending outgoing call does not defer it**; it
+  leaves every dialog, route, the media and the registration-event subscription alone. Its answer
+  is accepted only if it matches the request's Call-ID, CSeq number, method and Via branch, and the
+  lifetime comes from this line's own `Contact`. The P-CSCF, not the UE, adds the
+  `integrity-protected` parameter (TS 24.229 §5.2.2.2).
+- A refresh that cannot be sent, or goes unanswered, first rebuilds the Gm client connection on the live
+  security association and is sent once more. The network closes an idle Gm connection (seen on Jio within
+  an hour), and the full renewal that used to run here hid that by opening a new one; the rebuild is not a
+  P-CSCF fault and marks nothing. Only a second failure reaches the pool logic below.
+- Failures of a refresh keep the existing session. A `403`, `408`, `500` or `504` (and a fresh
+  authentication challenge, `401`, until background re-authentication exists) asks for a full
+  re-registration, which waits for a call to end like any disruptive recovery
+  (`Maintenance::RegistrationRecovery`). A `503` with `Retry-After` longer than Timer F marks the
+  P-CSCF unavailable and fails over; a shorter one retries the same P-CSCF after the wait. A `423`
+  retries once with `Min-Expires`. After two final error answers in a row the next cycle uses the
+  full re-registration, and in-place refresh is tried again after that succeeds. A registration
+  that expires during a call is reported unregistered and the call is left running.
+- While an incoming call rings (up to 50 s) the dispatch loop is parked in the ring wait, so the wait drives the
+  refresh itself: it sends one that falls due, retransmits on UDP, applies the Timer F timeout and takes the
+  registrar's answer there. A failure that ends the refresh is kept and returned on the loop's next pass, so the
+  call is not ended over it.
 - Acts as a SIP UAS on **two** fronts for a single call: the carrier's Gm-protected IMS transport
   (answering inbound `INVITE`s), and a second, unauthenticated plain-SIP link on
   `crate::vowifi::VETH_SIP_PORT` that Agent B's PJSIP dials into once it decides to bridge a call.

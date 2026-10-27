@@ -22,7 +22,8 @@ use super::ImsRegisterConfig;
 use crate::control::protocol::RegistrationStatus;
 use crate::error::{BridgeError, BridgeResult};
 use std::net::SocketAddr;
-use std::sync::mpsc;
+use std::sync::{mpsc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime};
 
 /// How long the Gm client reader blocks before checking whether it should
@@ -64,11 +65,28 @@ pub(crate) struct Inbound {
     /// without this, restarting just the client half would need a new
     /// channel, which would orphan `_server`'s already-spawned accept-loop
     /// threads (they hold their own clone of the original sender).
-    tx: mpsc::Sender<(SipMessage, SipSink)>,
+    pub(crate) tx: mpsc::Sender<(SipMessage, SipSink)>,
     /// Held only for its `Drop`, which shuts the listener down. Replaced
     /// wholesale on re-registration, since a renewal negotiates a fresh SA
     /// on a fresh pair of ports.
     pub(crate) _server: Option<GmServer>,
+    /// The thread reading the client connection. It ends when the network
+    /// closes that connection, which is how a closed one is noticed without a
+    /// keepalive; see [`Inbound::client_reader_alive`].
+    client_reader: Mutex<JoinHandle<()>>,
+}
+
+impl Inbound {
+    /// Whether the client connection's reader is still running. A P-CSCF that
+    /// closes an idle Gm connection (Jio does, within minutes) stops it, and
+    /// until a write fails nothing else says the connection is gone.
+    pub(crate) fn client_reader_alive(&self) -> bool {
+        !self
+            .client_reader
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_finished()
+    }
 }
 
 /// Spawns the thread that reads the **client** connection we registered
@@ -88,10 +106,10 @@ pub(crate) struct Inbound {
 fn spawn_client_reader(
     session: &super::RegisteredSession,
     tx: mpsc::Sender<(SipMessage, SipSink)>,
-) -> BridgeResult<()> {
+) -> BridgeResult<JoinHandle<()>> {
     let mut client_reader = session.transport()?.try_clone_reader()?;
     let client_sink = session.transport()?.sink()?;
-    std::thread::spawn(move || loop {
+    Ok(std::thread::spawn(move || loop {
         match client_reader.recv_message_deadline(CLIENT_READ_POLL_INTERVAL) {
             Ok(Some(msg)) => {
                 if tx.send((msg, client_sink.clone())).is_err() {
@@ -104,8 +122,7 @@ fn spawn_client_reader(
                 return;
             }
         }
-    });
-    Ok(())
+    }))
 }
 
 /// Start reading both halves of the Gm association for `session`:
@@ -119,7 +136,7 @@ fn spawn_client_reader(
 pub(crate) fn start_inbound(session: &super::RegisteredSession) -> BridgeResult<Inbound> {
     let (tx, rx) = mpsc::channel();
 
-    spawn_client_reader(session, tx.clone())?;
+    let client_reader = spawn_client_reader(session, tx.clone())?;
 
     let server = match session.gm_server_addr() {
         Some(addr) => Some(spawn_gm_server(addr, session.use_tcp, tx.clone())?),
@@ -135,6 +152,7 @@ pub(crate) fn start_inbound(session: &super::RegisteredSession) -> BridgeResult<
         rx,
         tx,
         _server: server,
+        client_reader: Mutex::new(client_reader),
     })
 }
 
@@ -150,7 +168,35 @@ pub(crate) fn restart_client_reader(
     session: &super::RegisteredSession,
     inbound: &Inbound,
 ) -> BridgeResult<()> {
-    spawn_client_reader(session, inbound.tx.clone())
+    let reader = spawn_client_reader(session, inbound.tx.clone())?;
+    *inbound
+        .client_reader
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = reader;
+    Ok(())
+}
+
+/// Ends the client connection and its reader, so the connection's local port
+/// can be bound again. The reader holds its own handle onto the connection,
+/// which keeps it open (and the port taken) for as long as the peer does, so
+/// closing the session's handle is not enough. A no-op over UDP, where the
+/// reader's read cannot be woken and the socket is rebound with
+/// `SO_REUSEADDR`.
+pub(crate) fn stop_client_reader(session: &super::RegisteredSession, inbound: &Inbound) {
+    if !session.use_tcp {
+        return;
+    }
+    if let Ok(transport) = session.transport() {
+        transport.abort();
+    }
+    let old = std::mem::replace(
+        &mut *inbound
+            .client_reader
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()),
+        std::thread::spawn(|| {}),
+    );
+    let _ = old.join();
 }
 
 /// Restarts just the Gm protected-server-port listener after its accept loop
@@ -1326,6 +1372,53 @@ pub(crate) fn header_uri(req: &SipRequest, name: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn stopping_the_client_reader_frees_its_port_while_the_peer_stays_connected() {
+        // A refresh that gets no answer leaves the connection open at the
+        // peer. Rebuilding it must still be able to bind the same local port.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let dst = listener.local_addr().unwrap();
+        let transport = crate::ims::sip_client::SipTransport::connect(dst, true).unwrap();
+        let port = transport.local_addr().unwrap().port();
+        let (_peer, _) = listener.accept().unwrap();
+        let session = crate::ims::test_session_with_sa(Some(transport), dst, None);
+        let inbound = start_inbound(&session).unwrap();
+
+        stop_client_reader(&session, &inbound);
+        // `reconnect_transport` drops the session's own handle next.
+        drop(session);
+
+        assert!(
+            crate::ims::sip_client::SipTransport::connect_from(port, dst, true).is_ok(),
+            "the local port is free again"
+        );
+    }
+
+    #[test]
+    fn the_client_reader_ends_when_the_network_closes_the_connection() {
+        // Jio closes an idle Gm connection; with no keepalive the reader ending
+        // is the only early sign, and it must be visible.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let transport =
+            crate::ims::sip_client::SipTransport::connect(listener.local_addr().unwrap(), true)
+                .unwrap();
+        let (peer, _) = listener.accept().unwrap();
+        let session =
+            crate::ims::test_session_with_sa(Some(transport), listener.local_addr().unwrap(), None);
+        let inbound = start_inbound(&session).unwrap();
+        assert!(inbound.client_reader_alive());
+
+        drop(peer);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while inbound.client_reader_alive() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            !inbound.client_reader_alive(),
+            "closing the connection stops its reader"
+        );
+    }
     use super::*;
 
     fn request_with(headers: &str) -> SipRequest {

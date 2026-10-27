@@ -206,12 +206,13 @@ fn caller_name_for_onward_signaling(
 /// response on a fresh tag after a `180` names a dialog the carrier has
 /// never seen (specs/084 FR-005).
 pub(super) fn handle_invite(
-    session: &crate::ims::RegisteredSession,
+    session: &mut crate::ims::RegisteredSession,
     req: &SipRequest,
     sink: &SipSink,
     inbound: &Inbound,
     ctx: &InviteContext,
     to_tag: &str,
+    ring_service: Option<&mut dyn RingService>,
 ) -> BridgeResult<Option<ActiveCall>> {
     let obs = ctx.obs;
     let call_id = req.header("Call-ID").unwrap_or_default().to_string();
@@ -261,7 +262,16 @@ pub(super) fn handle_invite(
     let offer_sdp = match invite_body_decision(req, to_tag) {
         InviteBody::Offerless => {
             return handle_offerless_invite(
-                session, req, sink, inbound, ctx, &call_id, &caller, started_at, to_tag,
+                session,
+                req,
+                sink,
+                inbound,
+                ctx,
+                &call_id,
+                &caller,
+                started_at,
+                to_tag,
+                ring_service,
             );
         }
         InviteBody::Offer(sdp) => sdp,
@@ -533,6 +543,7 @@ pub(super) fn handle_invite(
                 control: &mut control,
                 pending: None,
             };
+            let mut held = HeldMessages::new(&inbound.tx);
             let ringing = await_pbx_answer(
                 &call_id,
                 &ctrl_rx,
@@ -542,7 +553,16 @@ pub(super) fn handle_invite(
                 &contact,
                 sink,
                 Some(&mut forward_offer),
-            )?;
+                &mut held,
+                ring_service.map(|service| RingWork {
+                    service,
+                    session: &mut *session,
+                }),
+            );
+            // Back on the loop's queue before anything else is done with the
+            // outcome, including an error.
+            drop(held);
+            let ringing = ringing?;
             let forward_hop = forward_offer.pending.take();
             match ringing {
                 RingOutcome::Answered => {}
@@ -830,7 +850,7 @@ pub(super) fn handle_invite(
 /// (plan.md's own Constitution Check called out exactly this trade-off).
 #[allow(clippy::too_many_arguments)]
 fn handle_offerless_invite(
-    session: &crate::ims::RegisteredSession,
+    session: &mut crate::ims::RegisteredSession,
     req: &SipRequest,
     sink: &SipSink,
     inbound: &Inbound,
@@ -839,6 +859,7 @@ fn handle_offerless_invite(
     caller: &str,
     started_at: chrono::DateTime<Utc>,
     to_tag: &str,
+    ring_service: Option<&mut dyn RingService>,
 ) -> BridgeResult<Option<ActiveCall>> {
     let obs = ctx.obs;
     tracing::info!(call_id = %call_id, caller = %caller, "inbound INVITE carries no offer; will answer with our own");
@@ -933,7 +954,8 @@ fn handle_offerless_invite(
         sdp::CodecOffer::preferring_wideband(ctx.wideband && amr_safe::is_available()),
     );
 
-    match await_pbx_answer(
+    let mut held = HeldMessages::new(&inbound.tx);
+    let ring_outcome = await_pbx_answer(
         call_id,
         &ctrl_rx,
         &inbound.rx,
@@ -942,7 +964,14 @@ fn handle_offerless_invite(
         &contact,
         sink,
         None,
-    )? {
+        &mut held,
+        ring_service.map(|service| RingWork {
+            service,
+            session: &mut *session,
+        }),
+    );
+    drop(held);
+    match ring_outcome? {
         RingOutcome::Answered => {}
         RingOutcome::PbxDeclined { reason } => {
             obs.report_call_not_answered(
@@ -999,6 +1028,7 @@ fn handle_offerless_invite(
     // retransmitted by the network until this wait times out and this
     // bridge sends its *own*, redundant `BYE` for a dialog already ended
     // from the other side (code review finding, 2026-08-28).
+    let mut held = HeldMessages::new(&inbound.tx);
     let deadline = Instant::now() + OFFERLESS_ACK_TIMEOUT;
     // Outer `Some`: the ACK arrived. Inner: the SDP answer it carried, if
     // its body had a usable one (`ack_answer`).
@@ -1006,7 +1036,7 @@ fn handle_offerless_invite(
     let mut caller_bye = false;
     'wait_for_ack: while Instant::now() < deadline {
         while let Ok((msg, req_sink)) = inbound.rx.try_recv() {
-            let SipMessage::Request(candidate) = msg else {
+            let Some((candidate, req_sink)) = held.take_response(msg, req_sink) else {
                 continue;
             };
             let this_dialog = super::names_active_dialog(
@@ -1034,6 +1064,7 @@ fn handle_offerless_invite(
         std::thread::sleep(RING_POLL_INTERVAL);
     }
 
+    drop(held);
     if caller_bye {
         // The far end already ended this dialog — echoing our own `BYE`
         // back at it would be answering a call that no longer exists from
@@ -1318,6 +1349,66 @@ enum RingOutcome {
     Abandoned { reason: &'static str },
 }
 
+/// Work the ring wait does for the dispatch loop while that loop is parked,
+/// so a registration refresh keeps its replies and timers while a call rings.
+pub(super) trait RingService {
+    /// Takes a SIP response if it belongs to the service. `true` consumes it.
+    fn answer(
+        &mut self,
+        session: &mut crate::ims::RegisteredSession,
+        response: &crate::ims::sip_client::SipResponse,
+    ) -> bool;
+    /// Runs once per poll of the wait.
+    fn tick(&mut self, session: &mut crate::ims::RegisteredSession);
+}
+
+/// A [`RingService`] with the session it works on, lent to the ring wait.
+pub(super) struct RingWork<'a> {
+    pub(super) service: &'a mut dyn RingService,
+    pub(super) session: &'a mut crate::ims::RegisteredSession,
+}
+
+/// Responses that arrive while the dispatch loop is parked in a ring or ACK
+/// wait. The wait has no use for them, but the loop does: the answer to a
+/// registration refresh or a SUBSCRIBE would otherwise be read and thrown
+/// away, and the transaction would later time out as if it had never been
+/// answered. They go back on the loop's queue when the wait is over, in the
+/// order they arrived, and the loop handles them before it judges any timer
+/// ([`super::LoopState::next_message`]).
+pub(super) struct HeldMessages<'a> {
+    tx: &'a mpsc::Sender<(SipMessage, SipSink)>,
+    items: Vec<(SipMessage, SipSink)>,
+}
+
+impl<'a> HeldMessages<'a> {
+    pub(super) fn new(tx: &'a mpsc::Sender<(SipMessage, SipSink)>) -> Self {
+        Self {
+            tx,
+            items: Vec::new(),
+        }
+    }
+
+    /// Takes `msg` if it is not a request, handing a request back for the
+    /// wait to deal with.
+    fn take_response(&mut self, msg: SipMessage, sink: SipSink) -> Option<(SipRequest, SipSink)> {
+        match msg {
+            SipMessage::Request(req) => Some((req, sink)),
+            response => {
+                self.items.push((response, sink));
+                None
+            }
+        }
+    }
+}
+
+impl Drop for HeldMessages<'_> {
+    fn drop(&mut self) {
+        for item in self.items.drain(..) {
+            let _ = self.tx.send(item);
+        }
+    }
+}
+
 /// Hold the carrier in the ringing state until Agent B reports the PBX
 /// extension was actually answered.
 ///
@@ -1337,6 +1428,8 @@ fn await_pbx_answer(
     contact: &str,
     sink: &SipSink,
     mut forward: Option<&mut ForwardOffer<'_>>,
+    held: &mut HeldMessages<'_>,
+    mut work: Option<RingWork<'_>>,
 ) -> BridgeResult<RingOutcome> {
     let decline = |status: u16, reason: &str| {
         respond(
@@ -1351,7 +1444,12 @@ fn await_pbx_answer(
         // 1. Did the caller give up while it rang? A CANCEL must be answered
         //    promptly or the network keeps retransmitting it.
         while let Ok((msg, req_sink)) = sip_rx.try_recv() {
-            let SipMessage::Request(req) = msg else {
+            if let (SipMessage::Response(response), Some(w)) = (&msg, work.as_mut()) {
+                if w.service.answer(w.session, response) {
+                    continue;
+                }
+            }
+            let Some((req, req_sink)) = held.take_response(msg, req_sink) else {
                 continue;
             };
             if req.method == "CANCEL" && req.header("Call-ID") == Some(call_id) {
@@ -1393,6 +1491,12 @@ fn await_pbx_answer(
                 continue;
             }
             tracing::debug!(method = %req.method, "ignoring inbound request received while ringing");
+        }
+
+        // Replies were read above; only now are the service's timers judged,
+        // so an answer that arrived in time is not timed out ahead of itself.
+        if let Some(w) = work.as_mut() {
+            w.service.tick(w.session);
         }
 
         // 2. Did Agent B report an answer, or give up on the PBX?
@@ -1505,7 +1609,7 @@ mod tests {
                 .unwrap()
                 .sink()
                 .unwrap();
-            let (_sip_tx, sip_rx) = mpsc::channel::<(SipMessage, SipSink)>();
+            let (sip_tx, sip_rx) = mpsc::channel::<(SipMessage, SipSink)>();
             let (ctrl_tx, ctrl_rx) = mpsc::channel::<ControlMessage>();
             ctrl_tx
                 .send(ControlMessage::BridgeFailed {
@@ -1517,6 +1621,7 @@ mod tests {
                 "From: <sip:+919000000000@ims.example>;tag=abc\r\nTo: <sip:me@ims.example>\r\n",
             );
 
+            let mut held = HeldMessages::new(&sip_tx);
             let outcome = await_pbx_answer(
                 "c1",
                 &ctrl_rx,
@@ -1525,6 +1630,8 @@ mod tests {
                 "tag180",
                 "<sip:me@10.0.0.9>",
                 &sink,
+                None,
+                &mut held,
                 None,
             )
             .unwrap();
@@ -1539,6 +1646,179 @@ mod tests {
             assert!(sent.starts_with(status_line), "{reason}: {sent}");
             assert!(sent.contains(";tag=tag180"), "{reason}: {sent}");
         }
+    }
+
+    #[test]
+    fn the_ring_wait_services_the_registration_refresh() {
+        // A refresh due while a call rings must be driven from the wait, and
+        // its answer taken there rather than left for after the call.
+        struct Service {
+            ticks: u32,
+            answered: Vec<u16>,
+            answers_before_first_tick: Option<usize>,
+        }
+        impl RingService for Service {
+            fn answer(
+                &mut self,
+                _session: &mut crate::ims::RegisteredSession,
+                response: &crate::ims::sip_client::SipResponse,
+            ) -> bool {
+                self.answered.push(response.status);
+                response
+                    .header("CSeq")
+                    .is_some_and(|c| c.ends_with("REGISTER"))
+            }
+            fn tick(&mut self, _session: &mut crate::ims::RegisteredSession) {
+                self.ticks += 1;
+                self.answers_before_first_tick
+                    .get_or_insert(self.answered.len());
+            }
+        }
+
+        let carrier = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let sink =
+            crate::ims::sip_client::SipTransport::connect(carrier.local_addr().unwrap(), false)
+                .unwrap()
+                .sink()
+                .unwrap();
+        let (sip_tx, sip_rx) = mpsc::channel::<(SipMessage, SipSink)>();
+        let (ctrl_tx, ctrl_rx) = mpsc::channel::<ControlMessage>();
+        let reply = |status: u16, cseq: &str| {
+            SipMessage::Response(crate::ims::sip_client::SipResponse {
+                status,
+                reason: "OK".into(),
+                headers: vec![("CSeq".into(), cseq.into())],
+                body: String::new(),
+            })
+        };
+        sip_tx
+            .send((reply(200, "7 REGISTER"), sink.clone()))
+            .unwrap();
+        sip_tx
+            .send((reply(200, "3 SUBSCRIBE"), sink.clone()))
+            .unwrap();
+        ctrl_tx
+            .send(ControlMessage::CallAnswered {
+                call_id: "c1".into(),
+            })
+            .unwrap();
+        let req = invite_with_headers("From: <sip:+919000000000@ims.example>;tag=abc\r\n");
+        let mut session =
+            crate::ims::test_session_with_sa(None, carrier.local_addr().unwrap(), None);
+        let mut service = Service {
+            ticks: 0,
+            answered: Vec::new(),
+            answers_before_first_tick: None,
+        };
+
+        let mut held = HeldMessages::new(&sip_tx);
+        let outcome = await_pbx_answer(
+            "c1",
+            &ctrl_rx,
+            &sip_rx,
+            &req,
+            "tag",
+            "<sip:me@10.0.0.9>",
+            &sink,
+            None,
+            &mut held,
+            Some(RingWork {
+                service: &mut service,
+                session: &mut session,
+            }),
+        )
+        .unwrap();
+        drop(held);
+
+        assert!(matches!(outcome, RingOutcome::Answered));
+        assert!(service.ticks >= 1, "the wait drives the service");
+        assert_eq!(
+            service.answers_before_first_tick,
+            Some(2),
+            "queued replies are read before timers are judged"
+        );
+        assert_eq!(
+            service.answered,
+            vec![200, 200],
+            "both replies were offered"
+        );
+        let (left, _) = sip_rx.try_recv().expect("the other reply is held");
+        assert!(
+            matches!(&left, SipMessage::Response(r) if r.header("CSeq") == Some("3 SUBSCRIBE"))
+        );
+        assert!(sip_rx.try_recv().is_err(), "the refresh reply was consumed");
+    }
+
+    #[test]
+    fn a_response_that_arrives_while_the_call_rings_is_held_not_thrown_away() {
+        // The answer to a registration refresh can land during the ring wait.
+        // It must still be there for the dispatch loop afterwards.
+        let carrier = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let sink =
+            crate::ims::sip_client::SipTransport::connect(carrier.local_addr().unwrap(), false)
+                .unwrap()
+                .sink()
+                .unwrap();
+        let (sip_tx, sip_rx) = mpsc::channel::<(SipMessage, SipSink)>();
+        let (ctrl_tx, ctrl_rx) = mpsc::channel::<ControlMessage>();
+        let response = SipMessage::Response(crate::ims::sip_client::SipResponse {
+            status: 200,
+            reason: "OK".into(),
+            headers: vec![("CSeq".into(), "7 REGISTER".into())],
+            body: String::new(),
+        });
+        sip_tx.send((response, sink.clone())).unwrap();
+        ctrl_tx
+            .send(ControlMessage::CallAnswered {
+                call_id: "c1".into(),
+            })
+            .unwrap();
+        let req = invite_with_headers("From: <sip:+919000000000@ims.example>;tag=abc\r\n");
+
+        let mut held = HeldMessages::new(&sip_tx);
+        let outcome = await_pbx_answer(
+            "c1",
+            &ctrl_rx,
+            &sip_rx,
+            &req,
+            "tag",
+            "<sip:me@10.0.0.9>",
+            &sink,
+            None,
+            &mut held,
+            None,
+        )
+        .unwrap();
+        assert!(matches!(outcome, RingOutcome::Answered));
+        assert!(
+            sip_rx.try_recv().is_err(),
+            "nothing is re-queued while the wait runs"
+        );
+
+        drop(held);
+        let (back, _) = sip_rx
+            .try_recv()
+            .expect("the response is back on the queue");
+        match back {
+            SipMessage::Response(r) => assert_eq!(r.header("CSeq"), Some("7 REGISTER")),
+            _ => panic!("expected the response"),
+        }
+    }
+
+    #[test]
+    fn a_request_is_not_held_it_is_the_waits_to_handle() {
+        let carrier = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let sink =
+            crate::ims::sip_client::SipTransport::connect(carrier.local_addr().unwrap(), false)
+                .unwrap()
+                .sink()
+                .unwrap();
+        let (tx, rx) = mpsc::channel::<(SipMessage, SipSink)>();
+        let mut held = HeldMessages::new(&tx);
+        let req = invite_with_headers("From: <sip:+919000000000@ims.example>;tag=abc\r\n");
+        assert!(held.take_response(SipMessage::Request(req), sink).is_some());
+        drop(held);
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
@@ -2104,7 +2384,7 @@ mod tests {
             .unwrap()
             .sink()
             .unwrap();
-        let (_sip_tx, sip_rx) = mpsc::channel::<(SipMessage, SipSink)>();
+        let (sip_tx, sip_rx) = mpsc::channel::<(SipMessage, SipSink)>();
         let (ctrl_tx, ctrl_rx) = mpsc::channel::<ControlMessage>();
         for m in script {
             ctrl_tx.send(m).unwrap();
@@ -2122,6 +2402,7 @@ mod tests {
             control: &mut a_end,
             pending: None,
         };
+        let mut held = HeldMessages::new(&sip_tx);
         let outcome = await_pbx_answer(
             "c1",
             &ctrl_rx,
@@ -2131,6 +2412,8 @@ mod tests {
             "<sip:me@10.0.0.9>",
             &sink,
             Some(&mut offer),
+            &mut held,
+            None,
         )
         .unwrap();
         assert!(matches!(outcome, RingOutcome::Answered));
