@@ -111,6 +111,18 @@ pub(super) struct PendingOrigination {
     from_tag: String,
     branch: String,
     invite_cseq: u32,
+    /// The Via sent-by the INVITE went out with. A CANCEL must repeat it to match
+    /// the transaction, even if a re-authentication has since moved the session
+    /// to another client port.
+    invite_local_addr: std::net::SocketAddr,
+    /// The connection the INVITE went out on. A CANCEL goes to the same place
+    /// (RFC 3261 §9.1), even after a re-authentication has moved the session
+    /// to a new connection; the old one is kept open while this call is pending.
+    invite_sink: Option<crate::ims::sip_client::SipSink>,
+    /// The `Security-Verify` echo of the association that connection belongs
+    /// to (RFC 3329 §2.3.1). A request sent on the old connection repeats the
+    /// old echo, not the one a later re-authentication installed.
+    invite_security_verify: Option<String>,
     /// In-dialog requests sent after the INVITE (each `PRACK`), so a later
     /// `BYE` picks a `CSeq` above them rather than reusing one — RFC 3261
     /// §12.2.1.1 requires the sequence to increase within a dialog.
@@ -373,6 +385,9 @@ pub(super) fn begin_origination(
         security_verify: session.security_verify(),
     });
 
+    let invite_local_addr = session.local_addr;
+    let invite_sink = session.transport().and_then(|t| t.sink()).ok();
+    let invite_security_verify = session.security_verify().map(str::to_string);
     tracing::info!(call_id, destination, "outbound: sending INVITE to carrier");
     let transport = match session.transport_mut() {
         Ok(t) => t,
@@ -418,6 +433,9 @@ pub(super) fn begin_origination(
         from_tag,
         branch,
         invite_cseq,
+        invite_local_addr,
+        invite_sink,
+        invite_security_verify,
         extra_cseq: 0,
         pracked_rseq: None,
         provisional_answer: None,
@@ -522,23 +540,39 @@ impl PendingOrigination {
     /// transport was momentarily unavailable and the caller should keep the
     /// origination alive and retry, rather than assume the INVITE was cancelled.
     fn send_cancel_now(&mut self, session: &mut crate::ims::RegisteredSession) -> bool {
-        let cancel = crate::ims::call::build_cancel(&crate::ims::call::CancelParts {
-            request_uri: &self.callee_uri,
-            route_headers: &self.route_headers,
-            via_transport: self.via_transport,
-            local_addr: session.local_addr,
-            public_uri: &session.origination_identity(),
-            callee_uri: &self.callee_uri,
-            call_id: &self.call_id,
-            from_tag: &self.from_tag,
-            cseq: self.invite_cseq,
-            branch: &self.branch,
-            security_verify: session.security_verify(),
-        });
-        let Ok(transport) = session.transport_mut() else {
-            return false;
+        let build = |security_verify: Option<&str>| {
+            crate::ims::call::build_cancel(&crate::ims::call::CancelParts {
+                request_uri: &self.callee_uri,
+                route_headers: &self.route_headers,
+                via_transport: self.via_transport,
+                local_addr: self.invite_local_addr,
+                public_uri: &session.origination_identity(),
+                callee_uri: &self.callee_uri,
+                call_id: &self.call_id,
+                from_tag: &self.from_tag,
+                cseq: self.invite_cseq,
+                branch: &self.branch,
+                security_verify,
+            })
         };
-        if transport.send(&cancel).is_ok() {
+        // On the connection the INVITE used while it is still open, repeating
+        // the security echo of that connection's association; otherwise on the
+        // session's current connection, with its own echo.
+        let on_invite_connection = self
+            .invite_sink
+            .as_ref()
+            .map(|sink| sink.send(&build(self.invite_security_verify.as_deref())));
+        let sent = match on_invite_connection {
+            Some(Ok(())) => true,
+            _ => {
+                let cancel = build(session.security_verify());
+                match session.transport_mut() {
+                    Ok(transport) => transport.send(&cancel).is_ok(),
+                    Err(_) => false,
+                }
+            }
+        };
+        if sent {
             tracing::info!(call_id = %self.call_id, "outbound: sent CANCEL for an abandoned INVITE");
             true
         } else {
@@ -1722,6 +1756,9 @@ mod tests {
             from_tag: "ftag".to_string(),
             branch: "z9hG4bKtest".to_string(),
             invite_cseq: 1,
+            invite_local_addr: "10.0.0.2:5060".parse().unwrap(),
+            invite_sink: None,
+            invite_security_verify: None,
             extra_cseq: 0,
             pracked_rseq: None,
             provisional_answer: None,
@@ -2426,6 +2463,80 @@ mod tests {
         let n = peer.recv(&mut buf).expect("CANCEL was not sent");
         assert!(String::from_utf8_lossy(&buf[..n]).starts_with("CANCEL "));
         assert!(p.awaiting_cancel());
+    }
+
+    /// A re-authentication can move the session to another client port while an
+    /// INVITE is still ringing. The CANCEL must still name the INVITE's own
+    /// sent-by, or the far end cannot match it to the transaction.
+    #[test]
+    fn a_cancel_repeats_the_via_the_invite_went_out_with() {
+        let (control, _server) = control_pair();
+        let (mut session, peer) = peer_session();
+        let (mut p, _ctrl_tx) = test_pending("out-cancel-via", control);
+        session.local_addr = "10.0.0.2:5999".parse().unwrap();
+
+        assert!(p.send_cancel_now(&mut session));
+
+        let mut buf = [0u8; 4096];
+        let n = peer.recv(&mut buf).unwrap();
+        let cancel = String::from_utf8_lossy(&buf[..n]).to_string();
+        assert!(cancel.contains("10.0.0.2:5060"), "{cancel}");
+        assert!(!cancel.contains("5999"), "{cancel}");
+    }
+
+    /// After a re-authentication the session sends on a new connection, but the
+    /// CANCEL for an INVITE still ringing goes where the INVITE went.
+    #[test]
+    fn a_cancel_goes_out_on_the_connection_the_invite_used() {
+        let (control, _server) = control_pair();
+        let (mut session, old_peer) = peer_session();
+        let (mut p, _ctrl_tx) = test_pending("out-cancel-route", control);
+        p.invite_sink = Some(session.transport().unwrap().sink().unwrap());
+        let new_peer = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        new_peer
+            .set_read_timeout(Some(std::time::Duration::from_millis(300)))
+            .unwrap();
+        session.transport = Some(
+            crate::ims::sip_client::SipTransport::connect(new_peer.local_addr().unwrap(), false)
+                .unwrap(),
+        );
+
+        assert!(p.send_cancel_now(&mut session));
+
+        let mut buf = [0u8; 4096];
+        let n = old_peer
+            .recv(&mut buf)
+            .expect("CANCEL on the INVITE's connection");
+        assert!(String::from_utf8_lossy(&buf[..n]).starts_with("CANCEL "));
+        assert!(
+            new_peer.recv(&mut buf).is_err(),
+            "not on the new connection"
+        );
+    }
+
+    /// A request on the old connection repeats that association's Security-Verify
+    /// (RFC 3329 §2.3.1), not the one a later re-authentication installed.
+    #[test]
+    fn a_cancel_on_the_old_connection_repeats_the_old_security_verify() {
+        let (control, _server) = control_pair();
+        let (mut session, old_peer) = peer_session();
+        let (mut p, _ctrl_tx) = test_pending("out-cancel-verify", control);
+        p.invite_sink = Some(session.transport().unwrap().sink().unwrap());
+        p.invite_security_verify = Some("old-offers".to_string());
+        session.gm_state = crate::ims::test_session_with_sa(
+            None,
+            old_peer.local_addr().unwrap(),
+            Some("new-offers"),
+        )
+        .gm_state;
+
+        assert!(p.send_cancel_now(&mut session));
+
+        let mut buf = [0u8; 4096];
+        let n = old_peer.recv(&mut buf).unwrap();
+        let cancel = String::from_utf8_lossy(&buf[..n]).to_string();
+        assert!(cancel.contains("Security-Verify: old-offers"), "{cancel}");
+        assert!(!cancel.contains("new-offers"), "{cancel}");
     }
 
     /// An attempt the carrier already answered is told why, and its leg BYEd.
