@@ -71,7 +71,22 @@ across releases.
   before. `vowifi-status` recent calls show `media_path=`. Outbound calls are
   never forwarded. Needs a phone or `[sip_server]` that passes AMR through.
 
+- **IMS registration refreshes in place, during calls** (#163). A scheduled
+  renewal is a protected `REGISTER` on the live Gm connection: it no longer
+  waits for a call to end or replaces the connection, subscription and security
+  associations. A network-requested AKA challenge is answered in the background,
+  with the new Gm SAs installed beside the working ones and rolled back on
+  failure. Renewal starts 600 s before expiry (TS 24.229 §5.1.1.4.1).
+  `vowifi-status` and `volte-status` show the refresh state.
+
 ### Changed
+
+- **VoLTE always bridges, each line in its own network namespace** (#165,
+  breaking). `[volte].enabled = true` always bridges incoming calls, and the
+  registration-only mode is gone. Remove `[volte].bridge_inbound`,
+  `[volte].status_path` and `[volte].lock_path` from `config.toml`; the bridge
+  refuses to start with them. `volte-register` is removed (use `volte-listen`),
+  and `gsm_sip_bridge_volte_registrations_total` is dropped.
 
 - **The supervisor's P-CSCF probe is off by default.** The line supervisor's
   TCP connect to each P-CSCF's unprotected SIP port, which no handset makes,
@@ -223,6 +238,13 @@ across releases.
   ([#127](https://github.com/selvakn/gsm-sip-bridge/issues/127)).
 
 ### Fixed
+
+- **VoLTE on raw-IP modem links, and wrong-family P-CSCFs** (#165). A VoLTE
+  line on a point-to-point link (rmnet, qmimux) gets a default route through
+  its interface when no router advertisement arrives. The move of the LTE
+  interface into the line's namespace is verified, and the supervisor moves a
+  re-created interface back in. A P-CSCF whose address family the IMS PDN does
+  not carry is rejected with a log line naming `[[volte.line]].pcscf`.
 
 - **A silent ePDG can no longer freeze charon.** Every `swanctl --initiate` is
   bounded by a deadline (`--timeout 20`, outer timeout 25 + 2 s) and runs as

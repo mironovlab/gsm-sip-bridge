@@ -1,10 +1,8 @@
 # Release Notes
 
-<!-- Rename this "## Unreleased" heading to the real "## vX.Y.Z" at release
-     time — publish.yml's notes extractor matches ^## v${TAG}$ exactly, so an
-     "Unreleased" heading is not picked up for the GitHub release. -->
-## Unreleased
+## v8.24.0
 
+- **The idle OPTIONS keepalive is off by default** -- The IMS agent no longer sends a SIP `OPTIONS` to the P-CSCF every 120 s on an idle line. `[vowifi].gm_options_keepalive = true` restores it, for both VoWiFi and VoLTE lines. A dead Gm connection is still found by the reg-event `SUBSCRIBE` confirm probe, a failed send, the repair ladder or the registration renewal, and `gm_connection: up` now means no failure has been seen rather than a recent answer (#164).
 - **IMS registration refreshes during calls, in place** -- A scheduled renewal is now an ordinary protected `REGISTER` on the connection already in use, so it no longer waits for a call to end or replaces the connection, subscription and security associations. A call can no longer outlast its registration, even while it rings, and `vowifi-status`/`volte-status` show the refresh state. A Gm connection the network closes while idle, which Jio does within minutes, is noticed and rebuilt before an outgoing call or a refresh uses it. Details in `docs/vowifi-bridge.md`. Reported by @mironovlab (#163).
 - **IMS re-authentication during calls** -- When the network answers a registration refresh with a fresh authentication challenge, the SIM now answers it in the background and the new Gm security associations are installed beside the working ones, with the protected server port unchanged. Calls, notifications and the registration-event subscription carry on throughout, and the old connection drains before it is removed. Any failure rolls the new associations back and falls back to a full re-registration, as before. Reported by @mironovlab (#163).
 - **IMS registration renews on the standard schedule** -- Renewal now starts 600 seconds before expiry (halfway through a grant of 1200 seconds or less), per 3GPP TS 24.229 section 5.1.1.4.1, so a one-hour grant renews after 50 minutes instead of 55. Reported by @mironovlab (#163).
