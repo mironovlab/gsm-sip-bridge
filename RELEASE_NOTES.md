@@ -1,5 +1,12 @@
 # Release Notes
 
+<!-- Rename this "## Unreleased" heading to the real "## vX.Y.Z" at release
+     time — publish.yml's notes extractor matches ^## v${TAG}$ exactly, so an
+     "Unreleased" heading is not picked up for the GitHub release. -->
+## Unreleased
+
+- **A hung-up GSM line is not reused until the modem drops the call** -- When the bridge ends a circuit-switched call itself (the SIP side hung up, or a call could not be bridged), it used to treat the line as free the moment it sent `AT+CHUP`. The modem often reports nothing after a local hang-up, so a new incoming or outgoing call could be put on a line that still had a call up. The line now stays busy until the modem confirms the call is gone, either by `NO CARRIER` or by an empty `AT+CLCC` call list, which on an EC20 is normally immediate. If the call is still listed after 10 s, a module alert is sent; after 60 s the radio is cycled, and if the call is still listed the module is reset. A modem that refuses the reset keeps the line busy and is retried, and a line is never put back into service while the modem still lists a call: initialisation now checks `AT+CLCC` first and retries later if a call is up or the check fails. The module alert's recovery is sent when the line is back in service, including after a restart. A new `gsm_sip_bridge_cs_hangup_cleanup_total` counter records how each hang-up was confirmed (#160).
+
 ## v8.24.0
 
 - **The idle OPTIONS keepalive is off by default** -- The IMS agent no longer sends a SIP `OPTIONS` to the P-CSCF every 120 s on an idle line. `[vowifi].gm_options_keepalive = true` restores it, for both VoWiFi and VoLTE lines. A dead Gm connection is still found by the reg-event `SUBSCRIBE` confirm probe, a failed send, the repair ladder or the registration renewal, and `gm_connection: up` now means no failure has been seen rather than a recent answer (#164).
