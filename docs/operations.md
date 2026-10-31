@@ -1,5 +1,34 @@
 # Operations Guide
 
+## The Docker Compose stack
+
+`docker/docker-compose.yml` (see the README's
+[quick start](../README.md#quick-start-docker-compose)) starts:
+
+| Service | URL | Purpose |
+|---|---|---|
+| gsm-sip-bridge | `http://localhost:9091/metrics` | Bridge + metrics endpoint |
+| Prometheus | `http://localhost:9090` | Metrics collection and querying |
+| Grafana | `http://localhost:3000` | Dashboards (admin/admin) |
+| sqlite-web | `http://localhost:8088` | Browse call and SMS database (read-only) |
+
+The container runs `privileged` with `/dev` bind-mounted, for USB device and
+ALSA access. It defaults to `network_mode: host` for the SIP/RTP media path.
+Update with `docker compose pull && docker compose up -d`.
+
+### Image variants
+
+| Variant | Tags | Contains | Use when |
+|---|---|---|---|
+| slim (default) | `:<version>`, `:latest` | strongSwan VoWiFi engine only | Almost always: the default `[vowifi].tunnel_engine = "strongswan"` path |
+| full (on demand) | `:<version>-swu` | strongSwan plus the legacy SWu/Python engine | Only if you must run `[vowifi].tunnel_engine = "swu"` |
+
+The slim image omits the Python interpreter and the vendored SWu-IKEv2 dialer,
+saving about 72 MB. Configuring the `swu` engine on it aborts at startup with a
+message naming the `-swu` image. The full image is published on demand, not on
+every release. Build either locally with `make docker-build` or
+`make docker-build-swu`.
+
 ## CLI Card Management
 
 The `card` subcommands talk to the running daemon over its control socket (default: `/tmp/gsm-sip-bridge.sock`). The daemon must be running.

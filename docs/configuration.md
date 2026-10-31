@@ -104,7 +104,21 @@ category without one falls back to `[alerts].discord_webhook_url`. See
 
 ### `[webui]`
 
-The read-only management web UI (see the README's "Web UI" section). Off unless `enabled = true`. Served over plain HTTP on its own port; terminate TLS with a reverse proxy.
+The read-only management web UI. Off unless `enabled = true`. It shows one card per line (registration, tunnel, signal, calls in progress), call history, received SMS with a copy button for one-time codes, a timeline of alerts and recoveries, and the configuration the bridge started with, secrets redacted. It cannot place a call, send a message, restart a card or change anything: the only writes are login and logout.
+
+```toml
+[webui]
+enabled = true
+password = "env:WEBUI_PASSWORD"   # put the value in .env, not in this file
+```
+
+Then open `http://<host>:8080/`. A few things to know:
+
+- It speaks plain HTTP. SMS bodies carry one-time codes, so on anything other than a trusted LAN put a reverse proxy with TLS in front of it.
+- Five wrong passwords lock that address out for five minutes. Sessions last seven days and are forgotten when the bridge restarts.
+- Messages are read from the store, never from the modem, so looking at them does not mark anything read.
+- If the port is taken the bridge logs an error and carries on without the UI.
+- Signal strength is read from each modem every `[metrics].signal_poll_interval_seconds` (default 60; `0` turns it off), never during a call, and is also exported as `gsm_sip_bridge_signal_*` gauges.
 
 | Key | Type | Default | Description |
 |---|---|---|---|

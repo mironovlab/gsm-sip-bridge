@@ -9,6 +9,7 @@ depth.
 | Doc | What it covers |
 |---|---|
 | [Quick Start](https://github.com/selvakn/gsm-sip-bridge#quick-start-docker-compose) | Deploy the full stack with Docker Compose |
+| [features.md](features.md) | Everything the bridge does, in full |
 | [supported-hardware.md](supported-hardware.md) | Which modems/readers work, which call modes each supports, and one-time device setup |
 | [configuration.md](configuration.md) | Every `config.toml` key, with defaults, ranges, and example configs |
 
