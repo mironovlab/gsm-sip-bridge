@@ -35,7 +35,7 @@ use std::io;
 use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// How often a blocking `recv` wakes to re-check `stop`, bounding how
 /// quickly a hangup silences the relay. Matches `agent::RELAY_POLL_INTERVAL`.
@@ -279,10 +279,8 @@ impl Encoder {
     }
 }
 
-/// Growing RTP sequence/timestamp state for one direction of the relay. We
-/// re-originate packets rather than forwarding them, so their sequence
-/// numbers and timestamps are ours to generate — the far end's are
-/// meaningless once the payload has been re-encoded.
+/// Generated RTP identity for uplink audio, non-AMR audio and DTMF.
+/// Carrier AMR downlink retains its source identity through transcoding.
 struct RtpSender {
     seq: u16,
     timestamp: u32,
@@ -318,6 +316,39 @@ impl RtpSender {
     }
 }
 
+/// Translate source media time into the destination's RTP clock. Extending
+/// timestamp deltas before scaling keeps a 16kHz -> 8kHz stream continuous
+/// across source timestamp rollover. Equal-rate timestamps are unchanged.
+struct SourceClock {
+    source_rate: u32,
+    destination_rate: u32,
+    previous: Option<(u32, u32)>,
+    extended_timestamp: i64,
+}
+
+impl SourceClock {
+    fn new(source_rate: u32, destination_rate: u32) -> Self {
+        Self {
+            source_rate,
+            destination_rate,
+            previous: None,
+            extended_timestamp: 0,
+        }
+    }
+
+    fn timestamp(&mut self, ssrc: u32, timestamp: u32) -> u32 {
+        self.extended_timestamp = match self.previous {
+            Some((previous_ssrc, previous_ts)) if previous_ssrc == ssrc => {
+                self.extended_timestamp + timestamp.wrapping_sub(previous_ts) as i32 as i64
+            }
+            _ => i64::from(timestamp),
+        };
+        self.previous = Some((ssrc, timestamp));
+        (self.extended_timestamp * i64::from(self.destination_rate))
+            .div_euclid(i64::from(self.source_rate)) as u32
+    }
+}
+
 /// Bridge the carrier leg (`ims`) to Agent B's veth leg (`veth`), transcoding
 /// in both directions until `stop` is set.
 ///
@@ -326,6 +357,7 @@ impl RtpSender {
 /// the offers, never assumed. Sending RTP marked with a payload type or framed
 /// in a way the far end never agreed to gets the media discarded and the call
 /// torn down.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_transcoding_relay(
     ims: UdpSocket,
     veth: UdpSocket,
@@ -334,6 +366,7 @@ pub fn spawn_transcoding_relay(
     stop: Arc<AtomicBool>,
     meter: &super::media_stats::MediaMeter,
     rtcp: Option<super::rtcp::CarrierRtcpBundle>,
+    rtp_reorder_wait: Duration,
 ) -> BridgeResult<()> {
     if carrier.codec == NegotiatedCodec::Pcmu && veth_codec.codec == NegotiatedCodec::Pcmu {
         return Err(BridgeError::Ims(
@@ -373,6 +406,7 @@ pub fn spawn_transcoding_relay(
         veth_codec = ?veth_codec.codec,
         veth_payload_type = veth_codec.payload_type,
         resampling = carrier_rate != veth_rate,
+        rtp_reorder_wait_ms = rtp_reorder_wait.as_millis(),
         "starting transcoding relay"
     );
 
@@ -401,6 +435,7 @@ pub fn spawn_transcoding_relay(
             stop_a,
             carrier_rx,
             receiver_role,
+            amr_kind(carrier.codec).map(|_| rtp_reorder_wait),
         )
     });
     std::thread::spawn(move || {
@@ -416,6 +451,7 @@ pub fn spawn_transcoding_relay(
             stop,
             pbx_rx,
             sender_role,
+            None,
         )
     });
     Ok(())
@@ -430,11 +466,10 @@ pub fn spawn_transcoding_relay(
 const DTMF_EVENT_TIMESTAMP_GAP_DIVISOR: u32 = 4;
 
 /// One direction: decode `src`'s audio payloads to PCM, resample to the far
-/// leg's rate, and re-encode into whole `dst_codec` frames. PCM left over
-/// from a packet that didn't divide evenly into output frames (a 16 kHz
-/// AMR-WB frame is two 8 kHz PCMU packets; an 8 kHz one is half of an L16
-/// frame) carries over to the next packet rather than being padded or
-/// dropped.
+/// leg's rate, and re-encode into `dst_codec` frames. Carrier AMR downlink
+/// reorders packets before decoding and emits one packet per source frame,
+/// retaining sequence number, SSRC, marker and media time (scaled only if
+/// the RTP clock rates differ). Other paths accumulate PCM into whole frames.
 ///
 /// Not every packet on this socket is audio for `decoder`, though: an RFC
 /// 4733 `telephone-event` packet carries a DTMF digit, not audio, and a
@@ -459,6 +494,7 @@ fn relay_direction(
     stop: Arc<AtomicBool>,
     counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
     rtcp: Option<super::rtcp::RelayRtcpRole>,
+    source_timing: Option<Duration>,
 ) {
     let frame_samples = dst_codec.codec.frame_samples();
     // Only meaningful when `rtcp` is `Receiver`.
@@ -484,99 +520,163 @@ fn relay_direction(
     // Rate-limited by `SsrcTracker` so a peer alternating SSRC every packet
     // can't turn this into a log line per packet (PR review, 2026-08-27).
     let mut ssrc_tracker = rtp::SsrcTracker::new();
+    let mut reorder = source_timing.map(super::rtp_reorder::RtpReorderBuffer::new);
+    let mut source_clock = SourceClock::new(clock_rate, dst_codec.codec.sample_rate());
+    let mut read_timeout = RELAY_POLL_INTERVAL;
 
     while !stop.load(Ordering::Relaxed) {
-        let Some(n) = recv(&src, &mut buf, direction) else {
-            continue;
-        };
-        let Some(pkt) = rtp::parse_packet(&buf[..n]) else {
-            continue;
-        };
-        // Count the packet only once it parses as RTP — a malformed datagram is
-        // not audio that flowed, and counting it would mask a one-way call.
-        super::media_stats::bump(&counter);
-
-        // specs/046-rtcp-reporting: every received packet counts toward
-        // sequence continuity and jitter regardless of payload type — a
-        // DTMF event legitimately shares the audio stream's sequence-number
-        // space (RFC 4733), so excluding it here would read as a spurious
-        // gap on every keypress.
-        if let Some(super::rtcp::RelayRtcpRole::Receiver { tracker, ssrc }) = &rtcp {
-            if let Ok(mut t) = tracker.lock() {
-                t.on_packet(pkt.seq, pkt.timestamp, media_start.elapsed(), clock_rate);
+        let now = Instant::now();
+        let mut ready = reorder
+            .as_mut()
+            .map(|buffer| buffer.flush_expired(now))
+            .unwrap_or_default();
+        if ready.is_empty() {
+            // A missing packet must expire even when the source stops sending.
+            // Bound the socket wait by that gap's deadline, not the hangup poll.
+            let timeout = reorder
+                .as_ref()
+                .and_then(|buffer| buffer.deadline())
+                .map(|deadline| deadline.saturating_duration_since(now))
+                .unwrap_or(RELAY_POLL_INTERVAL)
+                .min(RELAY_POLL_INTERVAL)
+                .max(Duration::from_micros(1));
+            if timeout != read_timeout {
+                if let Err(e) = src.set_read_timeout(Some(timeout)) {
+                    tracing::warn!(error = %e, direction, "transcoding relay: set_read_timeout failed");
+                    return;
+                }
+                read_timeout = timeout;
             }
-            if let Ok(mut s) = ssrc.lock() {
-                *s = Some(pkt.ssrc);
-            }
-        }
-
-        if let Some((previous, new)) = ssrc_tracker.note_and_should_log(pkt.ssrc) {
-            tracing::info!(
-                direction,
-                previous_ssrc = previous,
-                new_ssrc = new,
-                "RTP source SSRC changed mid-call"
-            );
-        }
-
-        if Some(pkt.payload_type) == src_codec.dtmf_payload_type {
-            let Some(dtmf_sender) = dtmf_sender.as_mut() else {
-                // Nothing this leg's own answer negotiated to forward it on.
+            let Some(n) = recv(&src, &mut buf, direction) else {
                 continue;
             };
-            if dtmf_event_source_ts != Some(pkt.timestamp) {
-                // A new keypress: give it a fresh timestamp on our own
-                // independent DTMF stream, clearly advanced from whatever the
-                // previous event used.
-                dtmf_sender.timestamp = dtmf_sender
-                    .timestamp
-                    .wrapping_add(dst_codec.codec.sample_rate() / DTMF_EVENT_TIMESTAMP_GAP_DIVISOR);
-                dtmf_event_source_ts = Some(pkt.timestamp);
-                // Once per keypress, not per retransmitted packet — a DTMF
-                // digit that never reached the far leg used to be silently
-                // indistinguishable from one that was never pressed at all
-                // (specs/041 conformance review, RTP-02).
+            let Some(pkt) = rtp::parse_packet(&buf[..n]) else {
+                continue;
+            };
+            // Count the packet only once it parses as RTP — a malformed datagram is
+            // not audio that flowed, and counting it would mask a one-way call.
+            super::media_stats::bump(&counter);
+
+            // specs/046-rtcp-reporting: every received packet counts toward
+            // sequence continuity and jitter regardless of payload type — a
+            // DTMF event legitimately shares the audio stream's sequence-number
+            // space (RFC 4733), so excluding it here would read as a spurious
+            // gap on every keypress.
+            if let Some(super::rtcp::RelayRtcpRole::Receiver { tracker, ssrc }) = &rtcp {
+                if let Ok(mut t) = tracker.lock() {
+                    t.on_packet(pkt.seq, pkt.timestamp, media_start.elapsed(), clock_rate);
+                }
+                if let Ok(mut s) = ssrc.lock() {
+                    *s = Some(pkt.ssrc);
+                }
+            }
+
+            if let Some((previous, new)) = ssrc_tracker.note_and_should_log(pkt.ssrc) {
                 tracing::info!(
                     direction,
-                    event = pkt.payload.first().copied(),
-                    "forwarding a DTMF keypress"
+                    previous_ssrc = previous,
+                    new_ssrc = new,
+                    "RTP source SSRC changed mid-call"
                 );
             }
-            // 0 samples: repeated packets for one event share a timestamp: it
-            // is only bumped, above, when a new event starts.
-            if let Err(e) = dtmf_sender.send(&dst, pkt.payload, 0) {
-                tracing::warn!(error = %e, direction, "transcoding relay: DTMF forward failed");
+
+            // Include DTMF and unknown payloads: they share the source's RTP
+            // sequence space and must not look like missing audio packets.
+            ready = match &mut reorder {
+                Some(buffer) => buffer.push(buf[..n].to_vec(), Instant::now()),
+                None => vec![buf[..n].to_vec()],
+            };
+        }
+
+        for packet in ready {
+            if stop.load(Ordering::Relaxed) {
                 return;
             }
-            continue;
-        }
-        if pkt.payload_type != src_codec.payload_type {
-            // Comfort noise, or a payload type neither leg's answer named —
-            // not audio this decoder was built for.
-            continue;
-        }
-        let Some(pcm) = decoder.decode(pkt.payload) else {
-            continue;
-        };
-        pending.extend_from_slice(&resampler.process(pcm));
-
-        while pending.len() >= frame_samples {
-            let frame: Vec<i16> = pending.drain(..frame_samples).collect();
-            let Some(payload) = encoder.encode(&frame) else {
+            let Some(pkt) = rtp::parse_packet(&packet) else {
                 continue;
             };
-            // Captured before `send()` advances them — this is the identity
-            // and RTP timestamp actually going out on this packet
-            // (specs/046-rtcp-reporting FR-002b: the transcoding path
-            // reports under its own minted SSRC).
-            let (send_ssrc, send_ts) = (sender.ssrc, sender.timestamp);
-            let payload_len = payload.len();
-            if let Err(e) = sender.send(&dst, &payload, frame_samples as u32) {
-                tracing::warn!(error = %e, direction, "transcoding relay: send failed");
-                return;
+
+            if Some(pkt.payload_type) == src_codec.dtmf_payload_type {
+                let Some(dtmf_sender) = dtmf_sender.as_mut() else {
+                    // Nothing this leg's own answer negotiated to forward it on.
+                    continue;
+                };
+                if dtmf_event_source_ts != Some(pkt.timestamp) {
+                    // A new keypress: give it a fresh timestamp on our own
+                    // independent DTMF stream, clearly advanced from whatever the
+                    // previous event used.
+                    dtmf_sender.timestamp = dtmf_sender.timestamp.wrapping_add(
+                        dst_codec.codec.sample_rate() / DTMF_EVENT_TIMESTAMP_GAP_DIVISOR,
+                    );
+                    dtmf_event_source_ts = Some(pkt.timestamp);
+                    // Once per keypress, not per retransmitted packet — a DTMF
+                    // digit that never reached the far leg used to be silently
+                    // indistinguishable from one that was never pressed at all
+                    // (specs/041 conformance review, RTP-02).
+                    tracing::info!(
+                        direction,
+                        event = pkt.payload.first().copied(),
+                        "forwarding a DTMF keypress"
+                    );
+                }
+                // 0 samples: repeated packets for one event share a timestamp: it
+                // is only bumped, above, when a new event starts.
+                if let Err(e) = dtmf_sender.send(&dst, pkt.payload, 0) {
+                    tracing::warn!(error = %e, direction, "transcoding relay: DTMF forward failed");
+                    return;
+                }
+                continue;
             }
-            if let Some(super::rtcp::RelayRtcpRole::Sender(acc)) = &rtcp {
-                acc.record_sent(send_ssrc, payload_len as u64, send_ts);
+            if pkt.payload_type != src_codec.payload_type {
+                // Comfort noise, or a payload type neither leg's answer named —
+                // not audio this decoder was built for.
+                continue;
+            }
+            let Some(pcm) = decoder.decode(pkt.payload) else {
+                continue;
+            };
+            let pcm = resampler.process(pcm);
+            if source_timing.is_some() {
+                // AMR payload parsing produces exactly one 20ms frame. Both L16
+                // and PCMU can encode the whole resampled frame without changing
+                // packet boundaries or hiding gaps from Agent B's jitter buffer.
+                let Some(payload) = encoder.encode(&pcm) else {
+                    continue;
+                };
+                let mut output = rtp::build_packet(
+                    pkt.seq,
+                    source_clock.timestamp(pkt.ssrc, pkt.timestamp),
+                    pkt.ssrc,
+                    dst_codec.payload_type,
+                    &payload,
+                );
+                output[1] |= packet[1] & 0x80;
+                if let Err(e) = dst.send(&output) {
+                    tracing::warn!(error = %e, direction, "transcoding relay: send failed");
+                    return;
+                }
+                continue;
+            }
+            pending.extend_from_slice(&pcm);
+
+            while pending.len() >= frame_samples {
+                let frame: Vec<i16> = pending.drain(..frame_samples).collect();
+                let Some(payload) = encoder.encode(&frame) else {
+                    continue;
+                };
+                // Captured before `send()` advances them — this is the identity
+                // and RTP timestamp actually going out on this packet
+                // (specs/046-rtcp-reporting FR-002b: the transcoding path
+                // reports under its own minted SSRC).
+                let (send_ssrc, send_ts) = (sender.ssrc, sender.timestamp);
+                let payload_len = payload.len();
+                if let Err(e) = sender.send(&dst, &payload, frame_samples as u32) {
+                    tracing::warn!(error = %e, direction, "transcoding relay: send failed");
+                    return;
+                }
+                if let Some(super::rtcp::RelayRtcpRole::Sender(acc)) = &rtcp {
+                    acc.record_sent(send_ssrc, payload_len as u64, send_ts);
+                }
             }
         }
     }
@@ -604,8 +704,38 @@ fn recv(socket: &UdpSocket, buf: &mut [u8], what: &str) -> Option<usize> {
 }
 
 #[cfg(test)]
+#[path = "transcode_tests.rs"]
+mod relay_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_clock_preserves_equal_rate_timestamps_and_rollover() {
+        let mut clock = SourceClock::new(16000, 16000);
+        for timestamp in [u32::MAX - 319, 0, 320, 1280] {
+            assert_eq!(clock.timestamp(42, timestamp), timestamp);
+        }
+    }
+
+    #[test]
+    fn source_clock_scales_gaps_and_rollover_without_resetting() {
+        let mut clock = SourceClock::new(16000, 8000);
+        assert_eq!(clock.timestamp(42, u32::MAX - 319), 0x7fff_ff60);
+        assert_eq!(clock.timestamp(42, 0), 0x8000_0000);
+        assert_eq!(clock.timestamp(42, 960), 0x8000_01e0);
+        // A new SSRC establishes a separate source clock.
+        assert_eq!(clock.timestamp(43, 5000), 2500);
+    }
+
+    #[test]
+    fn source_clock_scaling_keeps_fractional_ticks_and_late_timestamps() {
+        let mut clock = SourceClock::new(16000, 8000);
+        for timestamp in [101, 102, 103, 104, 103] {
+            assert_eq!(clock.timestamp(42, timestamp), timestamp / 2);
+        }
+    }
 
     fn codec(codec: NegotiatedCodec, payload_type: u8) -> ChosenCodec {
         codec_with_dtmf(codec, payload_type, None)
@@ -714,6 +844,7 @@ mod tests {
             stop.clone(),
             &crate::ims::media_stats::MediaMeter::new(),
             None,
+            Duration::from_millis(40),
         )
         .unwrap();
 
@@ -775,6 +906,7 @@ mod tests {
             stop.clone(),
             &crate::ims::media_stats::MediaMeter::new(),
             None,
+            Duration::from_millis(40),
         )
         .unwrap();
 
@@ -818,6 +950,7 @@ mod tests {
             stop.clone(),
             &crate::ims::media_stats::MediaMeter::new(),
             None,
+            Duration::from_millis(40),
         )
         .unwrap();
 
@@ -894,6 +1027,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             &crate::ims::media_stats::MediaMeter::new(),
             None,
+            Duration::from_millis(40),
         )
         .is_err());
     }
@@ -916,6 +1050,7 @@ mod tests {
             stop,
             &crate::ims::media_stats::MediaMeter::new(),
             None,
+            Duration::from_millis(40),
         )
         .expect("8k carrier to 16k veth must resample rather than be refused");
     }
@@ -942,6 +1077,7 @@ mod tests {
             stop.clone(),
             &crate::ims::media_stats::MediaMeter::new(),
             None,
+            Duration::from_millis(40),
         )
         .unwrap();
 
@@ -1017,6 +1153,7 @@ mod tests {
             stop.clone(),
             &crate::ims::media_stats::MediaMeter::new(),
             None,
+            Duration::from_millis(40),
         )
         .unwrap();
 
@@ -1058,6 +1195,7 @@ mod tests {
             stop.clone(),
             &crate::ims::media_stats::MediaMeter::new(),
             None,
+            Duration::from_millis(40),
         )
         .unwrap();
 
