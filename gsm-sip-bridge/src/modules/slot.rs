@@ -15,7 +15,9 @@ use crate::modules::at_commander::{NetworkMode, NetworkType};
 use crate::modules::discovery::DiscoveredModule;
 use crate::modules::protocol::ModuleCmd;
 use crate::modules::scheduler::{RestartProgress, SlotView};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +41,11 @@ impl std::fmt::Display for LifecycleState {
 
 pub(crate) struct SlotState {
     pub(crate) slot: u32,
+    /// This entry's identity for the process lifetime ([`next_instance`]),
+    /// kept when the entry is updated in place or re-keyed. Every task in the
+    /// pool's `JoinSet` reports it ([`TaskExit`]), because a slot key can be
+    /// reused by another module while a task is in flight (gh#159).
+    pub(crate) instance: u64,
     pub(crate) module: DiscoveredModule,
     pub(crate) imei: String,
     pub(crate) phone_number: String,
@@ -109,6 +116,152 @@ pub(crate) fn backoff_delay(attempt: u32, initial_sec: u64, max_sec: u64) -> Dur
     let shift = attempt.min(30);
     let secs = initial_sec.saturating_mul(1u64 << shift);
     Duration::from_secs(secs.min(max_sec))
+}
+
+/// A fresh [`SlotState::instance`]; never repeats within a process.
+pub(crate) fn next_instance() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// What every task in the pool's `JoinSet` (module workers and the fallback
+/// restarts) returns when it ends.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TaskExit {
+    /// The key the entry had when the task was spawned; may be stale.
+    pub(crate) slot: u32,
+    pub(crate) module_id: String,
+    pub(crate) instance: u64,
+}
+
+/// The key of the entry a finished task belongs to. gh#159, Greptile on
+/// PR #178: a parked entry can be moved off its key (`place_slot`) while a
+/// restart task for it is in flight, and a healthy modem then initialises
+/// into that key; the task's exit must not reach the healthy modem. Matched
+/// by instance, not key: `None` when the entry is gone.
+pub(crate) fn exit_target(slots: &HashMap<u32, SlotState>, exit: &TaskExit) -> Option<u32> {
+    if slots
+        .get(&exit.slot)
+        .is_some_and(|s| s.instance == exit.instance)
+    {
+        return Some(exit.slot);
+    }
+    slots
+        .iter()
+        .find(|(_, s)| s.instance == exit.instance)
+        .map(|(k, _)| *k)
+}
+
+/// The modems the circuit-switched pool already holds, as a USB rescan must
+/// recognize them (gh#159). `GivenUp` slots are left out on purpose: the
+/// specs/022 recovery path depends on a later rescan rediscovering that
+/// modem.
+#[derive(Debug, Default)]
+pub(crate) struct OccupiedModems {
+    /// Exact USB topology of every held modem that has one; the rescan
+    /// passes these to discovery so their ports are never opened.
+    pub(crate) usb_paths: HashSet<String>,
+    /// Card ids of held modems with no resolved `usb_path` (an operator-pinned
+    /// port with no sysfs entry): the coarser fallback, since a card id can
+    /// collide between two modems.
+    pub(crate) fallback_card_ids: HashSet<String>,
+    serial_ports: HashSet<PathBuf>,
+}
+
+impl OccupiedModems {
+    pub(crate) fn from_slots(slots: &HashMap<u32, SlotState>) -> Self {
+        let mut occupied = Self::default();
+        for slot in slots
+            .values()
+            .filter(|s| s.lifecycle != LifecycleState::GivenUp)
+        {
+            occupied
+                .serial_ports
+                .insert(slot.module.serial_port.clone());
+            if slot.module.usb_path.is_empty() {
+                occupied.fallback_card_ids.insert(slot.module.id.clone());
+            } else {
+                occupied.usb_paths.insert(slot.module.usb_path.clone());
+            }
+        }
+        occupied
+    }
+
+    /// Whether a scan result is a modem the pool already holds — matched by
+    /// port, by exact USB topology, or by card id for a held modem without a
+    /// topology. A held modem *with* a topology never matches by card id, so
+    /// a different modem whose card id collides with it is still accepted.
+    pub(crate) fn contains(&self, module: &DiscoveredModule) -> bool {
+        self.serial_ports.contains(&module.serial_port)
+            || (!module.usb_path.is_empty() && self.usb_paths.contains(&module.usb_path))
+            || self.fallback_card_ids.contains(&module.id)
+    }
+}
+
+/// Whether this entry was initialised under its key. A slot's real key is the
+/// one the store assigns to the card's IMEI; an entry parked after a failed
+/// init has no IMEI yet and sits on a temporary key (`free_slot_key`), which
+/// a healthy modem's real key may equal.
+fn owns_its_key(state: &SlotState) -> bool {
+    !state.imei.is_empty()
+}
+
+/// Whether `key` is held by a slot that must not be replaced: an initialised,
+/// not `GivenUp` one (gh#159). The key comes from the card's IMEI, so a second
+/// init of a modem the pool already runs, or of another modem reporting the
+/// same IMEI, lands on it. A parked entry there does not count; see
+/// `move_slot`.
+pub(crate) fn live_slot_at(slots: &HashMap<u32, SlotState>, key: u32) -> bool {
+    slots
+        .get(&key)
+        .is_some_and(|s| s.lifecycle != LifecycleState::GivenUp && owns_its_key(s))
+}
+
+/// The lowest key no slot uses, for parking a module whose init failed (it
+/// has no IMEI-derived key yet). `slots.len()` is not that: with keys `{1}`
+/// it is `1`, which would overwrite the live slot.
+pub(crate) fn free_slot_key(slots: &HashMap<u32, SlotState>) -> u32 {
+    free_slot_key_except(slots, None)
+}
+
+fn free_slot_key_except(slots: &HashMap<u32, SlotState>, reserved: Option<u32>) -> u32 {
+    (0..=u32::MAX)
+        .find(|k| !slots.contains_key(k) && Some(*k) != reserved)
+        .expect("fewer than u32::MAX slots")
+}
+
+/// Puts `state` under its real key `key`, first moving any parked entry
+/// sitting there to a free key so it keeps retrying (gh#159, Greptile on
+/// PR #178: otherwise a modem that failed early would keep a healthy one out
+/// of service). The caller checks `live_slot_at` first; anything else left
+/// at `key` (a `GivenUp` entry) is replaced, as before.
+pub(crate) fn place_slot(slots: &mut HashMap<u32, SlotState>, key: u32, mut state: SlotState) {
+    if slots.get(&key).is_some_and(|s| !owns_its_key(s)) {
+        let mut parked = slots.remove(&key).expect("checked above");
+        let to = free_slot_key_except(slots, Some(key));
+        tracing::info!(
+            module = %parked.module.id,
+            from = key,
+            to = to,
+            "moving a parked module off the slot another module initialised into"
+        );
+        parked.slot = to;
+        slots.insert(to, parked);
+    }
+    state.slot = key;
+    slots.insert(key, state);
+}
+
+/// Re-keys the entry at `from` to its real key `to`, for a parked module that
+/// came up on retry. Its worker reports under `to`, so `on_worker_exit` and
+/// every event lookup would otherwise miss it, or hit another module's slot.
+pub(crate) fn move_slot(slots: &mut HashMap<u32, SlotState>, from: u32, to: u32) {
+    if from == to {
+        return;
+    }
+    if let Some(state) = slots.remove(&from) {
+        place_slot(slots, to, state);
+    }
 }
 
 /// specs/022-discord-critical-alerts (Greptile P1 fix): finds a stale
@@ -256,11 +409,13 @@ mod tests {
     fn slot_state(module_id: &str, lifecycle: LifecycleState) -> SlotState {
         SlotState {
             slot: 0,
+            instance: next_instance(),
             module: DiscoveredModule {
                 id: module_id.to_string(),
                 serial_port: PathBuf::from(format!("/dev/tty{module_id}")),
                 audio_device: String::new(),
                 usb_serial: String::new(),
+                usb_path: String::new(),
             },
             imei: String::new(),
             phone_number: String::new(),
@@ -274,6 +429,210 @@ mod tests {
             hanging_up: false,
             lifecycle_alert_open: false,
         }
+    }
+
+    fn held(module_id: &str, port: &str, usb_path: &str, lifecycle: LifecycleState) -> SlotState {
+        let mut state = slot_state(module_id, lifecycle);
+        state.module.serial_port = PathBuf::from(port);
+        state.module.usb_path = usb_path.to_string();
+        state
+    }
+
+    fn scanned(module_id: &str, port: &str, usb_path: &str) -> DiscoveredModule {
+        held(module_id, port, usb_path, LifecycleState::Ready).module
+    }
+
+    #[test]
+    fn occupied_modems_cover_every_lifecycle_but_given_up() {
+        let mut slots = HashMap::new();
+        slots.insert(0, held("a", "/dev/ttyUSB2", "1-1", LifecycleState::Ready));
+        slots.insert(
+            1,
+            held("b", "/dev/ttyUSB6", "1-2", LifecycleState::Initializing),
+        );
+        slots.insert(
+            2,
+            held("c", "/dev/ttyUSB10", "1-3", LifecycleState::Recovering),
+        );
+        slots.insert(
+            3,
+            held("d", "/dev/ttyUSB14", "1-4", LifecycleState::GivenUp),
+        );
+
+        let occupied = OccupiedModems::from_slots(&slots);
+        assert_eq!(
+            occupied.usb_paths,
+            ["1-1", "1-2", "1-3"].map(String::from).into()
+        );
+        assert!(!occupied.contains(&scanned("d", "/dev/ttyUSB14", "1-4")));
+    }
+
+    #[test]
+    fn a_held_modem_found_on_another_interface_is_recognized_by_usb_path() {
+        // gh#159: the worker holds ttyUSB2 exclusively, so the rescan's probe
+        // falls through to ttyUSB3 on the same modem.
+        let mut slots = HashMap::new();
+        slots.insert(
+            0,
+            held(
+                "ec20-ABCDEF",
+                "/dev/ttyUSB2",
+                "5-1.4",
+                LifecycleState::Ready,
+            ),
+        );
+
+        let occupied = OccupiedModems::from_slots(&slots);
+        assert!(occupied.contains(&scanned("ec20-ABCDEF", "/dev/ttyUSB3", "5-1.4")));
+    }
+
+    #[test]
+    fn a_different_modem_with_a_colliding_card_id_is_not_recognized() {
+        let mut slots = HashMap::new();
+        slots.insert(
+            0,
+            held(
+                "ec20-ABCDEF",
+                "/dev/ttyUSB2",
+                "5-1.4",
+                LifecycleState::Ready,
+            ),
+        );
+
+        let occupied = OccupiedModems::from_slots(&slots);
+        assert!(!occupied.contains(&scanned("ec20-ABCDEF", "/dev/ttyUSB7", "5-1.3")));
+    }
+
+    #[test]
+    fn a_held_modem_without_usb_path_falls_back_to_card_id() {
+        let mut slots = HashMap::new();
+        slots.insert(
+            0,
+            held("ec20-PINNED", "/dev/ttyUSB2", "", LifecycleState::Ready),
+        );
+
+        let occupied = OccupiedModems::from_slots(&slots);
+        assert!(occupied.usb_paths.is_empty());
+        assert_eq!(
+            occupied.fallback_card_ids,
+            ["ec20-PINNED".to_string()].into()
+        );
+        assert!(occupied.contains(&scanned("ec20-PINNED", "/dev/ttyUSB3", "5-1.4")));
+    }
+
+    fn initialised(module_id: &str, key: u32, lifecycle: LifecycleState) -> SlotState {
+        let mut state = slot_state(module_id, lifecycle);
+        state.slot = key;
+        state.imei = format!("imei-{module_id}");
+        state
+    }
+
+    fn parked(module_id: &str, key: u32) -> SlotState {
+        let mut state = slot_state(module_id, LifecycleState::Initializing);
+        state.slot = key;
+        state
+    }
+
+    #[test]
+    fn live_slot_at_protects_initialised_slots_but_not_given_up_or_parked() {
+        let mut slots = HashMap::new();
+        slots.insert(0, initialised("a", 0, LifecycleState::Ready));
+        slots.insert(1, initialised("b", 1, LifecycleState::Recovering));
+        slots.insert(2, initialised("c", 2, LifecycleState::GivenUp));
+        slots.insert(3, parked("d", 3));
+
+        assert!(live_slot_at(&slots, 0));
+        assert!(live_slot_at(&slots, 1));
+        assert!(!live_slot_at(&slots, 2));
+        assert!(!live_slot_at(&slots, 3));
+        assert!(!live_slot_at(&slots, 4));
+    }
+
+    #[test]
+    fn place_slot_moves_a_parked_module_off_a_healthy_modems_key() {
+        // Greptile on PR #178: modem A failed before its IMEI was read and was
+        // parked on key 0; modem B then initialises into store slot 0.
+        let mut slots = HashMap::new();
+        slots.insert(0, parked("a", 0));
+
+        place_slot(&mut slots, 0, initialised("b", 0, LifecycleState::Ready));
+
+        assert_eq!(slots[&0].module.id, "b");
+        assert_eq!(slots[&1].module.id, "a", "the parked module is kept");
+        assert_eq!(slots[&1].slot, 1);
+    }
+
+    #[test]
+    fn move_slot_rekeys_a_recovered_module_to_its_real_key() {
+        let mut slots = HashMap::new();
+        slots.insert(0, parked("b", 0));
+        slots.insert(2, parked("a", 2));
+
+        // `a` came up on retry and the store gave it slot 0.
+        slots.get_mut(&2).unwrap().imei = "imei-a".into();
+        move_slot(&mut slots, 2, 0);
+
+        assert_eq!(slots[&0].module.id, "a");
+        assert_eq!(slots[&0].slot, 0);
+        assert_eq!(
+            slots[&1].module.id, "b",
+            "the parked module moved, not lost"
+        );
+        assert!(!slots.contains_key(&2));
+    }
+
+    #[test]
+    fn a_task_exit_follows_its_entry_and_never_reaches_a_new_holder_of_the_key() {
+        // Greptile on PR #178: a restart is in flight for parked `a` at key 0;
+        // `a` is moved to key 1 and healthy `b` takes key 0.
+        let mut slots = HashMap::new();
+        slots.insert(0, parked("a", 0));
+        let exit = TaskExit {
+            slot: 0,
+            module_id: "a".into(),
+            instance: slots[&0].instance,
+        };
+        place_slot(&mut slots, 0, initialised("b", 0, LifecycleState::Ready));
+
+        assert_eq!(exit_target(&slots, &exit), Some(1));
+        slots.remove(&1);
+        assert_eq!(
+            exit_target(&slots, &exit),
+            None,
+            "entry gone: nothing to update"
+        );
+    }
+
+    #[test]
+    fn a_task_exit_for_an_entry_still_on_its_key_lands_there() {
+        let mut slots = HashMap::new();
+        slots.insert(3, initialised("a", 3, LifecycleState::Ready));
+        let exit = TaskExit {
+            slot: 3,
+            module_id: "a".into(),
+            instance: slots[&3].instance,
+        };
+        assert_eq!(exit_target(&slots, &exit), Some(3));
+    }
+
+    #[test]
+    fn move_slot_to_the_same_key_is_a_no_op() {
+        let mut slots = HashMap::new();
+        slots.insert(0, initialised("a", 0, LifecycleState::Ready));
+        move_slot(&mut slots, 0, 0);
+        assert_eq!(slots.len(), 1);
+        assert_eq!(slots[&0].module.id, "a");
+    }
+
+    #[test]
+    fn free_slot_key_never_reuses_an_existing_key() {
+        let mut slots = HashMap::new();
+        assert_eq!(free_slot_key(&slots), 0);
+        slots.insert(1, slot_state("a", LifecycleState::Ready));
+        // `slots.len()` would be 1 here, overwriting the live slot.
+        assert_eq!(free_slot_key(&slots), 0);
+        slots.insert(0, slot_state("b", LifecycleState::Ready));
+        assert_eq!(free_slot_key(&slots), 2);
     }
 
     #[test]
