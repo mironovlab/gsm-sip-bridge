@@ -2263,6 +2263,15 @@ impl LoopState {
         self.refresh_repaired = false;
     }
 
+    /// Tells the daemon the Gm state this loop starts from (#181), before
+    /// anything in the loop can change it. The daemon keeps the last value it
+    /// was told across an agent restart, so an agent that stayed silent here
+    /// would leave a previous agent's `false` on the web UI, the gauge and the
+    /// alert timer for as long as nothing else happened to report Gm.
+    fn publish_initial_gm_state(&self, obs: &observability::AgentObservability) {
+        obs.set_gm_connection_up(self.gm_conn.is_up());
+    }
+
     /// A reg-event NOTIFY reported our current binding deregistered: apply
     /// TS 24.229 §5.1.1.7's response for its event (§5.4.1.5 on the network
     /// side). `cooldown` is this line's `reg_rejected_cooldown_sec`.
@@ -2659,6 +2668,7 @@ fn dispatch_loop(
     let mut st = LoopState::new();
     st.pool = pool;
     st.ping.periodic = p.gm_options_keepalive;
+    st.publish_initial_gm_state(p.obs);
     let respond_on_client = p.respond_on_client;
     if respond_on_client {
         tracing::warn!(
