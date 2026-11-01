@@ -287,6 +287,131 @@ fn zero_wait_skips_immediately_and_discards_late_or_duplicate_amr_before_decodin
 }
 
 #[test]
+fn a_same_ssrc_sequence_restart_recovers_without_decoding_isolated_old_packets() {
+    let carrier = codec(NegotiatedCodec::AmrNb, 97);
+    let pbx = codec(NegotiatedCodec::Pcmu, 0);
+    let payloads = speech_payloads(AmrKind::Nb, true, 6);
+    let timestamps = [900_000, 900_160, 2_000, 2_160, 2_320, 2_480];
+
+    // Keep codec input identical in the reference run, with a continuous
+    // sequence run so it does not depend on restart detection itself.
+    let baseline = Relay::start(carrier, pbx, REORDER_WAIT);
+    let expected: Vec<_> = payloads
+        .iter()
+        .enumerate()
+        .map(|(index, payload)| {
+            baseline.downlink(&source_packet(
+                10_000 + index as u16,
+                timestamps[index],
+                97,
+                payload,
+            ));
+            receive(&baseline.pbx).payload
+        })
+        .collect();
+
+    let relay = Relay::start(carrier, pbx, Duration::from_millis(500));
+    relay.downlink(&source_packet(10_000, timestamps[0], 97, &payloads[0]));
+    assert_eq!(receive(&relay.pbx).payload, expected[0]);
+    // One stale packet cannot reset the source or mutate the AMR decoder.
+    // The following valid packet cancels this unconfirmed restart candidate.
+    relay.downlink(&source_packet(99, 1_840, 97, &payloads[5]));
+    assert_no_packet(&relay.pbx, Duration::from_millis(10));
+    relay.downlink(&source_packet(10_001, timestamps[1], 97, &payloads[1]));
+    let normal = receive(&relay.pbx);
+    assert_eq!((normal.seq, normal.timestamp), (10_001, timestamps[1]));
+    assert_eq!(normal.payload, expected[1]);
+
+    // A restarted source may keep its SSRC while starting a much lower
+    // sequence run. Consecutive packets must validate that new run promptly,
+    // without waiting for sequence numbers to catch up or for the gap timer.
+    relay
+        .pbx
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
+    for (index, payload) in payloads.iter().enumerate().skip(2) {
+        relay.downlink(&source_packet(
+            100 + (index - 2) as u16,
+            timestamps[index],
+            97,
+            payload,
+        ));
+    }
+    for (index, expected_payload) in expected.iter().enumerate().skip(2) {
+        let actual = receive(&relay.pbx);
+        let seq = 100 + (index - 2) as u16;
+        assert_eq!((actual.seq, actual.timestamp), (seq, timestamps[index]));
+        assert_eq!(actual.ssrc, SOURCE_SSRC);
+        assert_eq!(actual.marker, seq.is_multiple_of(2));
+        assert_eq!(actual.payload_type, 0);
+        assert_eq!(&actual.payload, expected_payload);
+    }
+    assert_no_packet(&relay.pbx, Duration::from_millis(60));
+}
+
+#[test]
+fn a_retired_ssrc_cannot_replace_the_active_source_or_clear_its_buffered_amr() {
+    let carrier = codec(NegotiatedCodec::AmrNb, 97);
+    let pbx = codec(NegotiatedCodec::Pcmu, 0);
+    let payloads = speech_payloads(AmrKind::Nb, true, 5);
+    let active_ssrc = 0x5566_eeff;
+    let packet = |seq, timestamp, ssrc: u32, payload: &[u8]| {
+        let mut packet = source_packet(seq, timestamp, 97, payload);
+        packet[8..12].copy_from_slice(&ssrc.to_be_bytes());
+        packet
+    };
+    let source_a = packet(10_000, 900_000, SOURCE_SSRC, &payloads[0]);
+    let source_b: Vec<_> = payloads
+        .iter()
+        .enumerate()
+        .skip(1)
+        .take(3)
+        .map(|(index, payload)| {
+            packet(
+                199 + index as u16,
+                1_840 + index as u32 * 160,
+                active_ssrc,
+                payload,
+            )
+        })
+        .collect();
+
+    // The reference includes the same real source change and codec frames,
+    // but no delayed packet from the source that has already been replaced.
+    let baseline = Relay::start(carrier, pbx, REORDER_WAIT);
+    baseline.downlink(&source_a);
+    let expected_a = receive(&baseline.pbx);
+    let expected_b: Vec<_> = source_b
+        .iter()
+        .map(|packet| {
+            baseline.downlink(packet);
+            receive(&baseline.pbx)
+        })
+        .collect();
+
+    let relay = Relay::start(carrier, pbx, Duration::from_millis(500));
+    relay.downlink(&source_a);
+    assert_eq!(receive(&relay.pbx), expected_a);
+    relay.downlink(&source_b[0]);
+    assert_eq!(receive(&relay.pbx), expected_b[0]);
+    relay.downlink(&source_b[2]);
+    assert_no_packet(&relay.pbx, Duration::from_millis(10));
+
+    // A late packet from retired A must neither enter the stateful decoder
+    // nor discard B's queued sequence 202 while sequence 201 is missing.
+    relay.downlink(&packet(10_001, 900_160, SOURCE_SSRC, &payloads[4]));
+    assert_no_packet(&relay.pbx, Duration::from_millis(30));
+    relay
+        .pbx
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
+    relay.downlink(&source_b[1]);
+    assert_eq!(receive(&relay.pbx), expected_b[1]);
+    assert_eq!(receive(&relay.pbx), expected_b[2]);
+    assert_no_packet(&relay.pbx, Duration::from_millis(60));
+}
+
+#[test]
 fn an_interleaved_dtmf_packet_completes_the_shared_sequence_space() {
     let mut carrier = codec(NegotiatedCodec::AmrNb, 97);
     carrier.dtmf_payload_type = Some(100);

@@ -4,15 +4,32 @@
 //! only changes delivery order; it has no playout clock or codec knowledge.
 
 use super::rtp;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::time::{Duration, Instant};
+
+/// Recent late packets must not masquerade as a source restart, even when
+/// several arrive in order. At 20ms ptime this covers two seconds of history.
+const RECENT_SEQUENCE_HISTORY: u16 = 100;
+/// Two far-back packets must belong to one short, consecutive run. An old
+/// isolated packet cannot remain evidence for a restart indefinitely.
+const RESTART_CONFIRMATION_WINDOW: Duration = Duration::from_secs(1);
+
+struct RestartCandidate {
+    seq: u16,
+    packet: Vec<u8>,
+    since: Instant,
+}
 
 pub(super) struct RtpReorderBuffer {
     max_wait: Duration,
     ssrc: Option<u32>,
+    // Remember every superseded source for this call: expiring or evicting
+    // one would let a late packet reset the active source's decoder input.
+    retired_ssrcs: HashSet<u32>,
     expected: u16,
     pending: BTreeMap<u16, Vec<u8>>,
     deadline: Option<Instant>,
+    restart_candidate: Option<RestartCandidate>,
 }
 
 impl RtpReorderBuffer {
@@ -20,9 +37,11 @@ impl RtpReorderBuffer {
         Self {
             max_wait,
             ssrc: None,
+            retired_ssrcs: HashSet::new(),
             expected: 0,
             pending: BTreeMap::new(),
             deadline: None,
+            restart_candidate: None,
         }
     }
 
@@ -37,10 +56,19 @@ impl RtpReorderBuffer {
         let (seq, ssrc) = (parsed.seq, parsed.ssrc);
 
         if self.ssrc != Some(ssrc) {
+            if self.retired_ssrcs.contains(&ssrc) {
+                // A straggler must not change the active sequence, pending
+                // speech or restart probation. Still honor its deadlines.
+                return self.flush_expired(now);
+            }
+            if let Some(previous) = self.ssrc {
+                self.retired_ssrcs.insert(previous);
+            }
             // A new source owns a new sequence space. Old-source packets
             // must not enter its decoder after the reset.
             self.pending.clear();
             self.deadline = None;
+            self.restart_candidate = None;
             self.ssrc = Some(ssrc);
             self.expected = seq.wrapping_add(1);
             return vec![packet];
@@ -51,8 +79,35 @@ impl RtpReorderBuffer {
         let mut ready = self.flush_expired(now);
         let distance = seq.wrapping_sub(self.expected);
         if distance >= 0x8000 {
-            return ready; // Already delivered, skipped, or otherwise too old.
+            // A same-SSRC source can restart its sequence far behind us.
+            // Confirm it with a second consecutive packet before either can
+            // reach the decoder. Check confirmation before the recent-history
+            // guard: the second packet may cross that guard's boundary.
+            match self.restart_candidate.take() {
+                Some(candidate) if seq == candidate.seq.wrapping_add(1) => {
+                    self.pending.clear();
+                    self.deadline = None;
+                    self.expected = seq.wrapping_add(1);
+                    ready.extend([candidate.packet, packet]);
+                }
+                Some(candidate) if seq == candidate.seq => {
+                    // Duplicates neither confirm nor extend probation.
+                    self.restart_candidate = Some(candidate);
+                }
+                _ if self.expected.wrapping_sub(seq) > RECENT_SEQUENCE_HISTORY => {
+                    self.restart_candidate = Some(RestartCandidate {
+                        seq,
+                        packet,
+                        since: now,
+                    });
+                }
+                _ => {} // Recently delivered/skipped packets remain too late.
+            }
+            return ready;
         }
+        // Traffic in the current sequence space invalidates an isolated
+        // restart candidate, including packets queued behind a live gap.
+        self.restart_candidate = None;
         if distance == 0 {
             self.expected = seq.wrapping_add(1);
             ready.push(packet);
@@ -69,6 +124,11 @@ impl RtpReorderBuffer {
     /// Allows the receive loop to release a batch even when no more packets
     /// arrive. The caller must wake at `deadline()` rather than await traffic.
     pub(super) fn flush_expired(&mut self, now: Instant) -> Vec<Vec<u8>> {
+        if self.restart_candidate.as_ref().is_some_and(|candidate| {
+            now.saturating_duration_since(candidate.since) >= RESTART_CONFIRMATION_WINDOW
+        }) {
+            self.restart_candidate = None;
+        }
         if self.deadline.is_some_and(|deadline| now >= deadline) {
             self.release_pending()
         } else {
@@ -81,6 +141,9 @@ impl RtpReorderBuffer {
     }
 
     fn release_pending(&mut self) -> Vec<Vec<u8>> {
+        // Delivering the current run is progress too: an older probe must not
+        // survive a timeout flush and later rewind the stream.
+        self.restart_candidate = None;
         self.deadline = None;
         let mut packets: Vec<_> = std::mem::take(&mut self.pending).into_iter().collect();
         // Numeric sorting alone would put 0 before 65535 at sequence wrap.
@@ -118,6 +181,151 @@ mod tests {
             assert_eq!(buffer.push(original.clone(), now), vec![original]);
             assert_eq!(buffer.deadline(), None);
         }
+    }
+
+    #[test]
+    fn same_ssrc_sequence_restart_recovers_after_two_consecutive_packets() {
+        for wait in [WAIT, Duration::ZERO] {
+            let now = Instant::now();
+            let mut buffer = RtpReorderBuffer::new(wait);
+            assert_eq!(seqs(buffer.push(packet(10_000), now)), [10_000]);
+            let first = packet(100);
+            let second = packet(101);
+            assert!(buffer.push(first.clone(), now).is_empty());
+            assert_eq!(
+                buffer.push(second.clone(), now + Duration::from_millis(20)),
+                [first, second]
+            );
+            assert_eq!(
+                seqs(buffer.push(packet(102), now + Duration::from_millis(40))),
+                [102]
+            );
+            assert_eq!(buffer.deadline(), None);
+        }
+    }
+
+    #[test]
+    fn recent_late_packets_cannot_confirm_a_restart() {
+        let now = Instant::now();
+        let mut buffer = RtpReorderBuffer::new(WAIT);
+        buffer.push(packet(10_000), now);
+        for seq in [9_998, 9_999, 10_000] {
+            assert!(buffer.push(packet(seq), now).is_empty());
+        }
+        assert_eq!(seqs(buffer.push(packet(10_001), now)), [10_001]);
+    }
+
+    #[test]
+    fn current_run_traffic_cancels_an_isolated_restart_candidate() {
+        let now = Instant::now();
+        // A recent duplicate, the expected packet, and a future packet that
+        // waits behind a gap all show activity in the current sequence run.
+        for current_seq in [10_000, 10_001, 10_002] {
+            let mut buffer = RtpReorderBuffer::new(WAIT);
+            buffer.push(packet(10_000), now);
+            assert!(buffer.push(packet(100), now).is_empty());
+            let ready = seqs(buffer.push(packet(current_seq), now));
+            if current_seq == 10_001 {
+                assert_eq!(ready, [10_001]);
+            } else {
+                assert!(ready.is_empty());
+            }
+            assert!(buffer
+                .push(packet(101), now + Duration::from_millis(1))
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn nonconsecutive_old_packets_need_a_new_consecutive_pair() {
+        let now = Instant::now();
+        let mut buffer = RtpReorderBuffer::new(WAIT);
+        buffer.push(packet(10_000), now);
+        assert!(buffer.push(packet(100), now).is_empty());
+        assert!(buffer.push(packet(102), now).is_empty());
+        assert_eq!(seqs(buffer.push(packet(103), now)), [102, 103]);
+    }
+
+    #[test]
+    fn confirmed_restart_discards_the_previous_runs_pending_batch() {
+        let now = Instant::now();
+        let mut buffer = RtpReorderBuffer::new(WAIT);
+        buffer.push(packet(10_000), now);
+        buffer.push(packet(10_003), now);
+        assert_eq!(buffer.deadline(), Some(now + WAIT));
+        assert!(buffer.push(packet(100), now).is_empty());
+        assert_eq!(seqs(buffer.push(packet(101), now)), [100, 101]);
+        assert_eq!(buffer.deadline(), None);
+        assert!(buffer.flush_expired(now + WAIT).is_empty());
+        assert_eq!(seqs(buffer.push(packet(102), now + WAIT)), [102]);
+    }
+
+    #[test]
+    fn timeout_delivery_cancels_a_restart_candidate() {
+        let now = Instant::now();
+        let mut buffer = RtpReorderBuffer::new(WAIT);
+        buffer.push(packet(10_000), now);
+        buffer.push(packet(10_003), now);
+        assert!(buffer.push(packet(100), now).is_empty());
+        assert_eq!(seqs(buffer.flush_expired(now + WAIT)), [10_003]);
+        assert!(buffer.push(packet(101), now + WAIT).is_empty());
+        assert_eq!(seqs(buffer.push(packet(102), now + WAIT)), [101, 102]);
+    }
+
+    #[test]
+    fn duplicate_candidates_do_not_extend_the_confirmation_window() {
+        let now = Instant::now();
+        let mut buffer = RtpReorderBuffer::new(WAIT);
+        buffer.push(packet(10_000), now);
+        assert!(buffer.push(packet(100), now).is_empty());
+        assert!(buffer
+            .push(packet(100), now + Duration::from_millis(900))
+            .is_empty());
+        // At the exact deadline the original candidate has expired, even
+        // though a duplicate was seen only 100ms ago.
+        assert!(buffer
+            .push(packet(101), now + RESTART_CONFIRMATION_WINDOW)
+            .is_empty());
+        assert_eq!(
+            seqs(buffer.push(packet(102), now + RESTART_CONFIRMATION_WINDOW)),
+            [101, 102]
+        );
+    }
+
+    #[test]
+    fn restart_confirmation_can_cross_the_recent_history_boundary() {
+        let now = Instant::now();
+        let mut buffer = RtpReorderBuffer::new(WAIT);
+        buffer.push(packet(10_000), now);
+        assert!(buffer.push(packet(9_900), now).is_empty());
+        assert_eq!(seqs(buffer.push(packet(9_901), now)), [9_900, 9_901]);
+        assert_eq!(seqs(buffer.push(packet(9_902), now)), [9_902]);
+    }
+
+    #[test]
+    fn restart_confirmation_handles_sequence_rollover() {
+        let now = Instant::now();
+        let mut buffer = RtpReorderBuffer::new(WAIT);
+        buffer.push(packet(10_000), now);
+        assert!(buffer.push(packet(u16::MAX), now).is_empty());
+        assert_eq!(seqs(buffer.push(packet(0), now)), [u16::MAX, 0]);
+        assert_eq!(seqs(buffer.push(packet(1), now)), [1]);
+    }
+
+    #[test]
+    fn ssrc_change_clears_restart_probation() {
+        let now = Instant::now();
+        let mut buffer = RtpReorderBuffer::new(WAIT);
+        buffer.push(packet(10_000), now);
+        assert!(buffer.push(packet(100), now).is_empty());
+        let new_source = |seq| rtp::build_packet(seq, 7, 99, 96, &[]);
+        let first = new_source(20_000);
+        assert_eq!(buffer.push(first.clone(), now), [first]);
+        assert!(buffer.push(new_source(101), now).is_empty());
+        assert_eq!(
+            buffer.push(new_source(102), now),
+            [new_source(101), new_source(102)]
+        );
     }
 
     #[test]
@@ -228,6 +436,85 @@ mod tests {
             seqs(buffer.push(rtp::build_packet(2, 167, 99, 96, &[]), now)),
             [2]
         );
+    }
+
+    #[test]
+    fn a_retired_ssrc_cannot_discard_the_active_sources_pending_packets() {
+        let now = Instant::now();
+        let mut buffer = RtpReorderBuffer::new(WAIT);
+        buffer.push(packet(100), now);
+        let new_source = |seq| rtp::build_packet(seq, u32::from(seq) * 160, 99, 96, &[]);
+        assert_eq!(buffer.push(new_source(10), now), [new_source(10)]);
+        assert!(buffer.push(new_source(12), now).is_empty());
+        assert!(buffer
+            .push(packet(101), now + Duration::from_millis(10))
+            .is_empty());
+        assert_eq!(buffer.deadline(), Some(now + WAIT));
+        assert_eq!(
+            buffer.push(new_source(11), now + Duration::from_millis(20)),
+            [new_source(11), new_source(12)]
+        );
+        assert_eq!(buffer.push(new_source(13), now + WAIT), [new_source(13)]);
+    }
+
+    #[test]
+    fn a_retired_ssrc_still_allows_the_active_sources_deadline_to_expire() {
+        let now = Instant::now();
+        let mut buffer = RtpReorderBuffer::new(WAIT);
+        buffer.push(packet(100), now);
+        let new_source = |seq| rtp::build_packet(seq, u32::from(seq) * 160, 99, 96, &[]);
+        buffer.push(new_source(10), now);
+        buffer.push(new_source(12), now);
+        assert_eq!(buffer.push(packet(101), now + WAIT), [new_source(12)]);
+        assert_eq!(buffer.deadline(), None);
+        assert_eq!(buffer.push(new_source(13), now + WAIT), [new_source(13)]);
+        assert!(buffer.push(packet(102), now + WAIT).is_empty());
+    }
+
+    #[test]
+    fn all_retired_ssrcs_remain_rejected_after_multiple_source_switches() {
+        let now = Instant::now();
+        let mut buffer = RtpReorderBuffer::new(WAIT);
+        let from_source = |ssrc, seq| rtp::build_packet(seq, 160, ssrc, 96, &[]);
+        for ssrc in 1..=32 {
+            let original = from_source(ssrc, 1);
+            assert_eq!(buffer.push(original.clone(), now), [original]);
+        }
+        for ssrc in 1..32 {
+            assert!(buffer.push(from_source(ssrc, 2), now).is_empty());
+        }
+        assert_eq!(buffer.push(from_source(32, 2), now), [from_source(32, 2)]);
+    }
+
+    #[test]
+    fn a_retired_ssrc_preserves_active_restart_probation_and_stays_retired() {
+        let now = Instant::now();
+        let mut buffer = RtpReorderBuffer::new(WAIT);
+        buffer.push(packet(1), now);
+        let new_source = |seq| rtp::build_packet(seq, u32::from(seq) * 160, 99, 96, &[]);
+        buffer.push(new_source(10_000), now);
+        assert!(buffer.push(new_source(100), now).is_empty());
+        assert!(buffer
+            .push(packet(2), now + Duration::from_millis(10))
+            .is_empty());
+        assert_eq!(
+            buffer.push(new_source(101), now + Duration::from_millis(20)),
+            [new_source(100), new_source(101)]
+        );
+        // Restarting the current sequence does not resurrect retired sources.
+        assert!(buffer.push(packet(3), now + WAIT).is_empty());
+        assert_eq!(buffer.push(new_source(102), now + WAIT), [new_source(102)]);
+    }
+
+    #[test]
+    fn a_retired_ssrc_stays_rejected_with_waiting_disabled() {
+        let now = Instant::now();
+        let mut buffer = RtpReorderBuffer::new(Duration::ZERO);
+        buffer.push(packet(1), now);
+        let new_source = |seq| rtp::build_packet(seq, u32::from(seq) * 160, 99, 96, &[]);
+        assert_eq!(buffer.push(new_source(10), now), [new_source(10)]);
+        assert!(buffer.push(packet(2), now).is_empty());
+        assert_eq!(buffer.push(new_source(11), now), [new_source(11)]);
     }
 
     #[test]
