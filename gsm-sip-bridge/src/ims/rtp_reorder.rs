@@ -4,7 +4,8 @@
 //! only changes delivery order; it has no playout clock or codec knowledge.
 
 use super::rtp;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{hash_map::DefaultHasher, BTreeMap, HashMap, HashSet, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
 /// Recent late packets must not masquerade as a source restart, even when
@@ -13,6 +14,9 @@ const RECENT_SEQUENCE_HISTORY: u16 = 100;
 /// Two far-back packets must belong to one short, consecutive run. An old
 /// isolated packet cannot remain evidence for a restart indefinitely.
 const RESTART_CONFIRMATION_WINDOW: Duration = Duration::from_secs(1);
+/// Remember one full sequence cycle of deliveries, including distinct media
+/// that reused a sequence after a restart. Bound memory even on long calls.
+const DELIVERED_PACKET_HISTORY: usize = u16::MAX as usize + 1;
 
 struct RestartCandidate {
     seq: u16,
@@ -26,6 +30,10 @@ pub(super) struct RtpReorderBuffer {
     // Remember every superseded source for this call: expiring or evicting
     // one would let a late packet reset the active source's decoder input.
     retired_ssrcs: HashSet<u32>,
+    // Count occurrences so delivering a reused identity after sequence wrap
+    // refreshes its history even when an older occurrence is then evicted.
+    delivered: HashMap<(u16, u64), usize>,
+    delivery_order: VecDeque<(u16, u64)>,
     expected: u16,
     pending: BTreeMap<u16, Vec<u8>>,
     deadline: Option<Instant>,
@@ -38,6 +46,8 @@ impl RtpReorderBuffer {
             max_wait,
             ssrc: None,
             retired_ssrcs: HashSet::new(),
+            delivered: HashMap::new(),
+            delivery_order: VecDeque::new(),
             expected: 0,
             pending: BTreeMap::new(),
             deadline: None,
@@ -69,8 +79,11 @@ impl RtpReorderBuffer {
             self.pending.clear();
             self.deadline = None;
             self.restart_candidate = None;
+            self.delivered.clear();
+            self.delivery_order.clear();
             self.ssrc = Some(ssrc);
             self.expected = seq.wrapping_add(1);
+            self.remember_delivery(&packet);
             return vec![packet];
         }
 
@@ -79,6 +92,16 @@ impl RtpReorderBuffer {
         let mut ready = self.flush_expired(now);
         let distance = seq.wrapping_sub(self.expected);
         if distance >= 0x8000 {
+            // Already decoded media is evidence against a restart, even if
+            // several old packets arrive consecutively. Reject it before it
+            // can seed or confirm probation, preserving the active batch.
+            if self
+                .delivered
+                .contains_key(&(seq, Self::media_identity(&parsed)))
+            {
+                self.restart_candidate = None;
+                return ready;
+            }
             // A same-SSRC source can restart its sequence far behind us.
             // Confirm it with a second consecutive packet before either can
             // reach the decoder. Check confirmation before the recent-history
@@ -88,6 +111,8 @@ impl RtpReorderBuffer {
                     self.pending.clear();
                     self.deadline = None;
                     self.expected = seq.wrapping_add(1);
+                    self.remember_delivery(&candidate.packet);
+                    self.remember_delivery(&packet);
                     ready.extend([candidate.packet, packet]);
                 }
                 Some(candidate) if seq == candidate.seq => {
@@ -110,6 +135,7 @@ impl RtpReorderBuffer {
         self.restart_candidate = None;
         if distance == 0 {
             self.expected = seq.wrapping_add(1);
+            self.remember_delivery(&packet);
             ready.push(packet);
             ready.extend(self.release_pending());
         } else {
@@ -140,6 +166,33 @@ impl RtpReorderBuffer {
         self.deadline
     }
 
+    fn media_identity(parsed: &rtp::ParsedPacket<'_>) -> u64 {
+        // Fingerprint media rather than the complete wire packet: extensions,
+        // padding and the marker bit may change on a retransmission. Include
+        // the payload so a real restart can reuse both counters for new audio.
+        let mut hash = DefaultHasher::new();
+        (parsed.timestamp, parsed.payload_type, parsed.payload).hash(&mut hash);
+        hash.finish()
+    }
+
+    fn remember_delivery(&mut self, packet: &[u8]) {
+        if let Some(parsed) = rtp::parse_packet(packet) {
+            let identity = (parsed.seq, Self::media_identity(&parsed));
+            *self.delivered.entry(identity).or_default() += 1;
+            self.delivery_order.push_back(identity);
+            if self.delivery_order.len() > DELIVERED_PACKET_HISTORY {
+                if let Some(oldest) = self.delivery_order.pop_front() {
+                    if let Some(count) = self.delivered.get_mut(&oldest) {
+                        *count -= 1;
+                        if *count == 0 {
+                            self.delivered.remove(&oldest);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn release_pending(&mut self) -> Vec<Vec<u8>> {
         // Delivering the current run is progress too: an older probe must not
         // survive a timeout flush and later rewind the stream.
@@ -151,7 +204,13 @@ impl RtpReorderBuffer {
         if let Some((last, _)) = packets.last() {
             self.expected = last.wrapping_add(1);
         }
-        packets.into_iter().map(|(_, packet)| packet).collect()
+        packets
+            .into_iter()
+            .map(|(_, packet)| {
+                self.remember_delivery(&packet);
+                packet
+            })
+            .collect()
     }
 }
 
@@ -211,6 +270,190 @@ mod tests {
         buffer.push(packet(10_000), now);
         for seq in [9_998, 9_999, 10_000] {
             assert!(buffer.push(packet(seq), now).is_empty());
+        }
+        assert_eq!(seqs(buffer.push(packet(10_001), now)), [10_001]);
+    }
+
+    #[test]
+    fn consecutive_delivered_duplicates_preserve_the_active_batch_and_deadline() {
+        let now = Instant::now();
+        let mut buffer = RtpReorderBuffer::new(WAIT);
+        for seq in 9_900..=10_000 {
+            assert_eq!(seqs(buffer.push(packet(seq), now)), [seq]);
+        }
+        assert!(buffer.push(packet(10_003), now).is_empty());
+        for seq in [9_900, 9_901] {
+            assert!(buffer
+                .push(packet(seq), now + Duration::from_millis(10))
+                .is_empty());
+            assert_eq!(buffer.deadline(), Some(now + WAIT));
+        }
+        assert_eq!(seqs(buffer.flush_expired(now + WAIT)), [10_003]);
+        assert_eq!(seqs(buffer.push(packet(10_004), now + WAIT)), [10_004]);
+    }
+
+    #[test]
+    fn a_delivered_duplicate_cannot_confirm_and_cancels_restart_probation() {
+        let now = Instant::now();
+        for candidate in [9_900, 9_899] {
+            let mut buffer = RtpReorderBuffer::new(Duration::ZERO);
+            buffer.push(packet(9_901), now);
+            buffer.push(packet(10_000), now);
+            assert!(buffer.push(packet(candidate), now).is_empty());
+            assert!(buffer.push(packet(9_901), now).is_empty());
+            // A duplicate also cancels a nonconsecutive candidate, so its
+            // successor cannot complete probation after that duplicate.
+            assert!(buffer.push(packet(candidate + 1), now).is_empty());
+            assert_eq!(seqs(buffer.push(packet(10_001), now)), [10_001]);
+        }
+    }
+
+    #[test]
+    fn genuine_restart_can_reuse_sequences_with_new_timestamps_or_payloads() {
+        let now = Instant::now();
+        for change_timestamp in [true, false] {
+            let mut buffer = RtpReorderBuffer::new(Duration::ZERO);
+            buffer.push(packet(100), now);
+            buffer.push(packet(101), now);
+            buffer.push(packet(10_000), now);
+            let restarted: Vec<_> = [100, 101]
+                .into_iter()
+                .map(|seq| {
+                    if change_timestamp {
+                        rtp::build_packet(seq, 0, 42, 96, &[0xf0, 0x04, 0x01])
+                    } else {
+                        // Both original counters may reset while the newly
+                        // encoded speech differs from the earlier frames.
+                        rtp::build_packet(seq, u32::from(seq) * 160, 42, 96, &[0xf0, 4, 2])
+                    }
+                })
+                .collect();
+            assert!(buffer.push(restarted[0].clone(), now).is_empty());
+            assert_eq!(buffer.push(restarted[1].clone(), now), restarted);
+        }
+    }
+
+    #[test]
+    fn delivered_history_includes_batches_released_on_a_gap_or_timeout() {
+        let now = Instant::now();
+        for fill_gap in [false, true] {
+            let mut buffer = RtpReorderBuffer::new(WAIT);
+            buffer.push(packet(1), now);
+            buffer.push(packet(100), now);
+            buffer.push(packet(101), now);
+            if fill_gap {
+                assert_eq!(seqs(buffer.push(packet(2), now)), [2, 100, 101]);
+            } else {
+                assert_eq!(seqs(buffer.flush_expired(now + WAIT)), [100, 101]);
+            }
+            buffer.push(packet(10_000), now + WAIT);
+            assert_eq!(seqs(buffer.flush_expired(now + WAIT * 2)), [10_000]);
+            assert!(buffer.push(packet(100), now + WAIT * 2).is_empty());
+            assert!(buffer.push(packet(101), now + WAIT * 2).is_empty());
+            assert_eq!(seqs(buffer.push(packet(10_001), now + WAIT * 2)), [10_001]);
+        }
+    }
+
+    #[test]
+    fn delivered_history_survives_a_same_ssrc_restart() {
+        let now = Instant::now();
+        let mut buffer = RtpReorderBuffer::new(Duration::ZERO);
+        buffer.push(packet(9_900), now);
+        buffer.push(packet(9_901), now);
+        buffer.push(packet(10_000), now);
+        buffer.push(packet(100), now);
+        assert_eq!(seqs(buffer.push(packet(101), now)), [100, 101]);
+        buffer.push(packet(10_000), now);
+        for seq in [9_900, 9_901, 100, 101] {
+            assert!(buffer.push(packet(seq), now).is_empty());
+        }
+        assert_eq!(seqs(buffer.push(packet(10_001), now)), [10_001]);
+    }
+
+    #[test]
+    fn old_media_stays_rejected_after_a_restart_reuses_its_sequence_numbers() {
+        let now = Instant::now();
+        let mut buffer = RtpReorderBuffer::new(WAIT);
+        for seq in 9_900..=10_000 {
+            buffer.push(packet(seq), now);
+        }
+        let restarted = |seq| rtp::build_packet(seq, 0, 42, 96, &[0xf0, 4, 2]);
+        assert!(buffer.push(restarted(9_900), now).is_empty());
+        assert_eq!(seqs(buffer.push(restarted(9_901), now)), [9_900, 9_901]);
+        for seq in 9_902..=10_000 {
+            buffer.push(restarted(seq), now);
+        }
+        buffer.push(restarted(10_003), now);
+        for replay in [
+            packet(9_900),
+            packet(9_901),
+            restarted(9_900),
+            restarted(9_901),
+        ] {
+            assert!(buffer.push(replay, now).is_empty());
+            assert_eq!(buffer.deadline(), Some(now + WAIT));
+        }
+        assert_eq!(
+            buffer.push(restarted(10_001), now),
+            [restarted(10_001), restarted(10_003)]
+        );
+    }
+
+    #[test]
+    fn delivered_history_is_scoped_to_the_active_ssrc() {
+        let now = Instant::now();
+        let mut buffer = RtpReorderBuffer::new(Duration::ZERO);
+        buffer.push(packet(9_900), now);
+        buffer.push(packet(9_901), now);
+        let new_source =
+            |seq| rtp::build_packet(seq, u32::from(seq) * 160, 99, 96, &[0xf0, 0x04, 0x01]);
+        buffer.push(new_source(10_000), now);
+        assert!(buffer.push(new_source(9_900), now).is_empty());
+        assert_eq!(seqs(buffer.push(new_source(9_901), now)), [9_900, 9_901]);
+    }
+
+    #[test]
+    fn sequence_wrap_allows_an_expected_packet_with_a_reused_media_identity() {
+        let now = Instant::now();
+        let mut buffer = RtpReorderBuffer::new(Duration::ZERO);
+        for seq in [0, 32_767, 65_534, 65_535, 0, 1] {
+            assert_eq!(seqs(buffer.push(packet(seq), now)), [seq]);
+        }
+    }
+
+    #[test]
+    fn history_is_bounded_and_reused_identities_remain_known_after_eviction() {
+        let now = Instant::now();
+        let mut buffer = RtpReorderBuffer::new(Duration::ZERO);
+        for seq in 0..=u16::MAX {
+            assert_eq!(seqs(buffer.push(packet(seq), now)), [seq]);
+        }
+        // Reuse exact identities as expected packets. Evicting their old
+        // occurrences must not forget the newly delivered occurrences too.
+        for seq in 0..=200 {
+            assert_eq!(seqs(buffer.push(packet(seq), now)), [seq]);
+        }
+        assert_eq!(buffer.delivery_order.len(), DELIVERED_PACKET_HISTORY);
+        assert!(buffer.delivered.len() <= DELIVERED_PACKET_HISTORY);
+        assert!(buffer.push(packet(0), now).is_empty());
+        assert!(buffer.push(packet(1), now).is_empty());
+        assert_eq!(seqs(buffer.push(packet(201), now)), [201]);
+    }
+
+    #[test]
+    fn changed_marker_extension_or_padding_cannot_disguise_delivered_media() {
+        let now = Instant::now();
+        let mut buffer = RtpReorderBuffer::new(Duration::ZERO);
+        buffer.push(packet(9_900), now);
+        buffer.push(packet(9_901), now);
+        buffer.push(packet(10_000), now);
+        for seq in [9_900, 9_901] {
+            let mut replay = packet(seq);
+            replay[0] |= 0x30; // RTP header extension and padding.
+            replay[1] |= 0x80; // Different marker bit, same media.
+            replay.splice(12..12, [0xbe, 0xde, 0, 1, 0, 0, 0, 0]);
+            replay.extend([0, 2]);
+            assert!(buffer.push(replay, now).is_empty());
         }
         assert_eq!(seqs(buffer.push(packet(10_001), now)), [10_001]);
     }

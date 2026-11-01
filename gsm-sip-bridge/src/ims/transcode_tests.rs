@@ -350,6 +350,62 @@ fn a_same_ssrc_sequence_restart_recovers_without_decoding_isolated_old_packets()
 }
 
 #[test]
+fn consecutive_old_duplicates_cannot_restart_the_source_or_discard_buffered_amr() {
+    let carrier = codec(NegotiatedCodec::AmrNb, 97);
+    let pbx = codec(NegotiatedCodec::Pcmu, 0);
+    let packets: Vec<_> = speech_payloads(AmrKind::Nb, true, 104)
+        .iter()
+        .enumerate()
+        .map(|(index, payload)| {
+            source_packet(
+                9_900 + index as u16,
+                200_000 + index as u32 * 160,
+                97,
+                payload,
+            )
+        })
+        .collect();
+
+    let baseline = Relay::start(carrier, pbx, Duration::ZERO);
+    let expected: Vec<_> = packets
+        .iter()
+        .map(|packet| {
+            baseline.downlink(packet);
+            receive(&baseline.pbx)
+        })
+        .collect();
+
+    let relay = Relay::start(carrier, pbx, Duration::from_millis(500));
+    // Actually deliver the old frames before replaying them: their RTP
+    // identities must remain recognizable beyond the recent-sequence guard.
+    for (packet, expected) in packets.iter().zip(&expected).take(101) {
+        relay.downlink(packet);
+        assert_eq!(&receive(&relay.pbx), expected);
+    }
+    relay.downlink(&packets[103]); // Sequence 10003 waits for 10001.
+    assert_no_packet(&relay.pbx, Duration::from_millis(10));
+
+    // These are byte-identical copies of delivered sequences 9900 and 9901,
+    // rather than new frames from a source that restarted its sequence run.
+    relay.downlink(&packets[0]);
+    relay.downlink(&packets[1]);
+    assert_no_packet(&relay.pbx, Duration::from_millis(30));
+    relay
+        .pbx
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
+
+    // Fill the original gap last so all three final frames leave together.
+    // Both PCM and source headers must match a run without the duplicate pair.
+    relay.downlink(&packets[102]);
+    relay.downlink(&packets[101]);
+    for expected in expected.iter().skip(101) {
+        assert_eq!(&receive(&relay.pbx), expected);
+    }
+    assert_no_packet(&relay.pbx, Duration::from_millis(60));
+}
+
+#[test]
 fn a_retired_ssrc_cannot_replace_the_active_source_or_clear_its_buffered_amr() {
     let carrier = codec(NegotiatedCodec::AmrNb, 97);
     let pbx = codec(NegotiatedCodec::Pcmu, 0);
